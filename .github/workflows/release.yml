@@ -1,0 +1,113 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+      - run: node scripts/package.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core
+          path: |
+            release/tmcp-core.zip
+            release/tmcp-core.tar.gz
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - run: npm ci
+      - run: node scripts/build-icon.mjs
+      - run: dotnet publish ui/PcMcp.csproj -c Release -r win-x64 --self-contained true -o dist-ui
+      - run: node scripts/package.mjs --gui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: release/tmcp-windows-x64.zip
+  publish:
+    needs: [core, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Publish verified archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          cd release
+          sha256sum tmcp-core.tar.gz tmcp-core.zip tmcp-windows-x64.zip > SHA256SUMS.txt
+          gh release create "$RELEASE_TAG" --verify-tag --generate-notes --title "TMCP $RELEASE_TAG" ./*
+  install-smoke:
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install released CLI on Unix
+        if: runner.os != 'Windows'
+        env:
+          TMCP_VERSION: ${{ inputs.tag || github.ref_name }}
+          TMCP_HOME: ${{ runner.temp }}/tmcp-installed
+          TMCP_ROOT: ${{ runner.temp }}
+          TMCP_NO_START: '1'
+          TMCP_NO_PATH: '1'
+        run: |
+          sh install.sh
+          "$TMCP_HOME/bin/tmcp" --help
+      - name: Install released CLI on Windows
+        if: runner.os == 'Windows'
+        shell: powershell
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          ./install.ps1 -Mode cli -InstallDir "$env:RUNNER_TEMP/tmcp-installed" -Root "$env:RUNNER_TEMP" -Version $env:RELEASE_TAG -NoStart -NoPathUpdate
+          & "$env:RUNNER_TEMP/tmcp-installed/bin/tmcp.cmd" --help

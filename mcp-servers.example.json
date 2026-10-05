@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "my-local-server": {
+      "command": "uvx",
+      "args": ["your-mcp-package"],
+      "env": { "API_KEY": "${env:MY_API_KEY}" },
+      "disabled": true
+    },
+    "my-http-server": {
+      "url": "http://127.0.0.1:9000/mcp",
+      "headers": { "Authorization": "Bearer ${env:MY_SERVER_TOKEN}" },
+      "disabled": true
+    },
+    "my-legacy-sse-server": {
+      "type": "sse",
+      "url": "http://127.0.0.1:9001/sse",
+      "disabled": true
+    }
+  },
+  "excludeServers": []
+}

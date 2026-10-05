@@ -1,0 +1,55 @@
+{
+  "name": "pc-mcp-tunnel",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Authenticated PC development tools over MCP and Cloudflare Tunnel",
+  "type": "module",
+  "bin": {
+    "tmcp": "dist/src/cli.js"
+  },
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "scripts": {
+    "setup": "tsx scripts/setup.ts",
+    "discover": "tsx scripts/discover.ts",
+    "dev": "tsx src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "build:ui": "node scripts/build-icon.mjs && dotnet publish ui/PcMcp.csproj -c Release -r win-x64 -o dist-ui",
+    "app": "npm run build && npm run build:ui && .\\dist-ui\\PcMcp.exe",
+    "check": "tsc -p tsconfig.check.json --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "test:ui": "playwright test",
+    "test:desktop": "tsx tests/desktop-smoke.ts",
+    "start": "node dist/src/main.js",
+    "tunnel": "node dist/src/main.js --tunnel quick",
+    "tunnel:named": "node dist/src/main.js --tunnel named",
+    "up": "node dist/src/cli.js start",
+    "down": "node dist/src/cli.js stop",
+    "status": "node dist/src/cli.js status --json",
+    "smoke": "tsx scripts/smoke.ts",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.2.1",
+    "jsonc-parser": "^3.3.1",
+    "picomatch": "^4.0.7",
+    "screenshot-desktop": "^1.15.6",
+    "sharp": "^0.35.5",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@types/express": "^5.0.6",
+    "@types/node": "^24.0.0",
+    "@types/picomatch": "^4.0.2",
+    "@types/screenshot-desktop": "^1.12.3",
+    "prettier": "^3.6.2",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.0"
+  }
+}

@@ -1,0 +1,13 @@
+node_modules
+dist
+dist-ui
+ui/bin
+ui/obj
+test-results
+playwright-report
+release
+*.bak
+.mcp-tunnel
+package-lock.json
+.env
+mcp-servers.json

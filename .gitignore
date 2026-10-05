@@ -1,0 +1,17 @@
+node_modules/
+dist/
+dist-ui/
+ui/bin/
+ui/obj/
+.env
+.env.*
+!.env.example
+.mcp-tunnel/
+mcp-servers.json
+coverage/
+test-results/
+playwright-report/
+ui/app.ico
+release/
+*.bak
+*.log

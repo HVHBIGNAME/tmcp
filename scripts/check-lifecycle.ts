@@ -83,12 +83,16 @@ try {
   console.log(`Isolated startup: ${Math.round(performance.now() - start)} ms`);
   const stop = performance.now();
   await writeFile(path.join(dataDir, 'stop.request'), new Date().toISOString());
+  // The supervisor may react to stop.request before this request is sent. Both paths
+  // must actually terminate it; the exit and deadline assertions below verify that.
   const response = await ipcFetch(dataDir, '/_control/shutdown', {
     method: 'POST',
     signal: AbortSignal.timeout(3000),
-  });
-  assert(response.ok);
-  await response.arrayBuffer();
+  }).catch(() => undefined);
+  if (response) {
+    assert(response.ok);
+    await response.arrayBuffer();
+  }
   const deadline = new AbortController();
   try {
     await Promise.race([

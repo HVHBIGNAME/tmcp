@@ -4,6 +4,7 @@ import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { version } from '../version.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import {
   StreamableHTTPClientTransport,
@@ -22,10 +23,12 @@ import { z } from 'zod';
 import { childEnvironment, type Config } from '../config.js';
 import { errorMessage, hash, isErrno, SerialQueue } from '../utils.js';
 import type { Logger } from '../tools.js';
+import { redactedStream } from '../redaction.js';
 import {
   discoverServers,
   publicServer,
   redact,
+  backendSecrets,
   type Discovery,
   type ServerSpec,
 } from './discovery.js';
@@ -127,10 +130,16 @@ export class Gateway {
         stderr: 'pipe',
         maxBufferSize: 20 * 1024 * 1024,
       });
-      transport.stderr?.on('data', (chunk: Buffer) => {
-        const message = redact(spec, chunk.toString('utf8').trim());
-        if (message) this.log({ event: 'backend_stderr', server: spec.id, message });
+      const output = redactedStream(backendSecrets(spec), (text) => {
+        if (text.trim())
+          this.log({
+            event: 'backend_stderr',
+            server: spec.id,
+            message: text.trim().slice(0, 2000),
+          });
       });
+      transport.stderr?.on('data', (chunk: Buffer) => output.write(chunk));
+      transport.stderr?.once('end', () => output.end());
       return transport;
     }
     if (spec.kind === 'sse' || forceSse) {
@@ -153,7 +162,7 @@ export class Gateway {
   private async open(backend: Backend, forceSse = false): Promise<Client> {
     const transport = this.makeTransport(backend.spec, forceSse);
     const client = new Client(
-      { name: 'pc-mcp-gateway', version: '1.0.0' },
+      { name: 'pc-mcp-gateway', version },
       { capabilities: { roots: { listChanged: false } } },
     );
     client.setRequestHandler(ListRootsRequestSchema, () => ({

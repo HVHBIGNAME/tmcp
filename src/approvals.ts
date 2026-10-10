@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { decide, fingerprint, summarize, type ApprovalRules } from './approval.js';
+import { SerialQueue } from './utils.js';
 
 export const approvalRequestSchema = z.object({
   id: z.string().uuid(),
@@ -9,7 +10,7 @@ export const approvalRequestSchema = z.object({
   summary: z.string(),
   cwd: z.string(),
   clientId: z.string(),
-  /** Where the request was sent, so a response from the GUI is not accepted twice. */
+  /** Which surface the owner was asked on. Either one may answer: both belong to the owner. */
   channel: z.enum(['gui', 'telegram']),
   requestedAt: z.string(),
   expiresAt: z.string(),
@@ -75,6 +76,7 @@ export class Approvals {
     clientId: string;
     rules: ApprovalRules;
     channel?: 'gui' | 'telegram';
+    onWait?: () => void;
   }): Promise<ApprovalOutcome> {
     const key = fingerprint(input.command, input.cwd);
     const verdict = decide(input.rules, input.command);
@@ -84,6 +86,7 @@ export class Approvals {
 
     if (this.pending.size >= this.limit)
       throw new Error('Too many commands are waiting for approval');
+    input.onWait?.();
     return this.ask({
       command: input.command,
       cwd: input.cwd,
@@ -176,7 +179,7 @@ export class Approvals {
 export class AuditLog {
   private readonly recent: AuditEntry[] = [];
   private readonly queue: string[] = [];
-  private flushing = false;
+  private readonly writes = new SerialQueue();
 
   constructor(
     private readonly sink: (lines: string[]) => Promise<void>,
@@ -185,6 +188,8 @@ export class AuditLog {
   ) {}
 
   async write(entry: AuditEntry): Promise<void> {
+    if (this.queue.length >= this.retention * 4)
+      throw new Error('Audit sink is unavailable; pending entry capacity reached');
     this.recent.push(entry);
     if (this.recent.length > this.retention)
       this.recent.splice(0, this.recent.length - this.retention);
@@ -193,19 +198,19 @@ export class AuditLog {
     await this.listener(entry);
   }
 
-  private async flush(): Promise<void> {
-    if (this.flushing) return;
-    this.flushing = true;
-    try {
-      const batch = this.queue.splice(0, this.queue.length);
-      if (batch.length) await this.sink(batch);
-    } finally {
-      this.flushing = false;
-    }
+  flush(): Promise<void> {
+    return this.writes.run(async () => {
+      while (this.queue.length) {
+        const batch = this.queue.slice();
+        await this.sink(batch);
+        this.queue.splice(0, batch.length);
+      }
+    });
   }
 
   tail(limit: number): AuditEntry[] {
-    return this.recent.slice(-limit).reverse();
+    const count = Math.floor(limit);
+    return count > 0 ? this.recent.slice(-count).reverse() : [];
   }
 
   clearRecent(): void {

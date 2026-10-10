@@ -14,7 +14,7 @@ import {
   startService,
   stopService,
 } from './service-control.js';
-import { Autostart } from './autostart.js';
+import { autostartFor } from './autostart.js';
 import { errorMessage } from './utils.js';
 import { permissions as allPermissions } from './permissions.js';
 
@@ -256,7 +256,7 @@ async function panel() {
             });
         } else if (choice === '7') {
           const config = configAt(project);
-          const startup = new Autostart(project, config.dataDir);
+          const startup = autostartFor(config);
           const status = await startup.status();
           print(`Автозапуск: ${status.enabled ? 'включён' : 'выключен'}. ${status.detail}`);
           const answer = await ask('1 — включить, 2 — выключить, Enter — назад: ');
@@ -314,7 +314,7 @@ try {
       print(status.mcpUrl);
     } else if (command === 'token') await tokenCommand(positionals[1] ?? 'list', positionals[2]);
     else if (command === 'autostart') {
-      const startup = new Autostart(project, config.dataDir);
+      const startup = autostartFor(config);
       const action = positionals[1] ?? 'status';
       if (!['on', 'off', 'status'].includes(action)) throw new Error('Use autostart on|off|status');
       print(action === 'status' ? await startup.status() : await startup.set(action === 'on'));

@@ -5,12 +5,17 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>PC MCP</title>
     <meta name="color-scheme" content="dark light" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-src 'none'"
+    />
     <link rel="icon" href="./logo.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="./style.css" />
+    <link rel="stylesheet" href="./traffic.css" />
   </head>
   <body>
     <div id="root"></div>
-    <div id="notifications" class="notifications" aria-label="Уведомления"></div>
+    <div id="notifications" class="notifications" role="region" aria-label="Уведомления"></div>
     <noscript>Для панели управления необходимо включить JavaScript.</noscript>
     <script type="module" src="./app.js"></script>
   </body>

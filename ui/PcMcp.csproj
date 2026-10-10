@@ -8,20 +8,22 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>PcMcp</AssemblyName>
     <RootNamespace>PcMcp</RootNamespace>
-    <Version>1.1.0</Version>
+    <Version>2.0.0</Version>
     <Product>TMCP Desktop</Product>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>app.ico</ApplicationIcon>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
-    <!-- Single file: WebView2 comes from the OS, so nothing else needs shipping.
+    <!-- Standalone builds embed the backend and runtimes as a verified payload.
          Trimming is off because Windows Forms is not trim-safe (NETSDK1175). -->
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>false</SelfContained>
     <PublishTrimmed>false</PublishTrimmed>
     <PublishReadyToRun>false</PublishReadyToRun>
     <DebugType>none</DebugType>
+    <PublishDocumentationFiles>false</PublishDocumentationFiles>
+    <PublishReferencesDocumentationFiles>false</PublishReferencesDocumentationFiles>
     <!-- Globalization must be on: WebView2 sends WM_INPUTLANGCHANGE when the keyboard
          layout changes, and WinForms turns that into CultureInfo, which throws
          CultureNotFoundException in invariant mode. NLS is used so no ICU has to ship. -->
@@ -38,6 +40,11 @@
 
   <ItemGroup>
     <EmbeddedResource Include="app.ico" LogicalName="PcMcp.app.ico" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(PayloadArchive)' != ''">
+    <EmbeddedResource Include="$(PayloadArchive)" LogicalName="PcMcp.Payload.zip" />
+    <EmbeddedResource Include="$(PayloadMetadata)" LogicalName="PcMcp.Payload.json" />
   </ItemGroup>
 
   <Target Name="RemoveUnusedWpfReference" BeforeTargets="ResolveAssemblyReferences">

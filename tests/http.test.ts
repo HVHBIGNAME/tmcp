@@ -6,14 +6,11 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { httpFixture, jsonBody } from './helpers.js';
 
 test('HTTP auth, Host/Origin validation, metadata and stateless JSON transport', async (t) => {
-  const { url, config, headers } = await httpFixture(t);
+  const { url, key, headers } = await httpFixture(t);
   const rejected = await fetch(`${url}/mcp`, { method: 'POST', body: '{}' });
   assert.equal(rejected.status, 401);
   assert.match(rejected.headers.get('www-authenticate') ?? '', /oauth-protected-resource\/mcp/);
-  assert.equal(
-    (await fetch(`${url}/mcp?token=${config.bearerToken}`, { method: 'POST' })).status,
-    401,
-  );
+  assert.equal((await fetch(`${url}/mcp?token=${key}`, { method: 'POST' })).status, 401);
   assert.equal(
     (await fetch(`${url}/mcp`, { method: 'POST', headers: { Authorization: 'Bearer invalid' } }))
       .status,
@@ -30,8 +27,7 @@ test('HTTP auth, Host/Origin validation, metadata and stateless JSON transport',
   assert.equal(rebound, 403);
   assert.equal(
     (
-      await fetch(`${url}/mcp`, {
-        method: 'POST',
+      await fetch(`${url}/_control/status`, {
         headers: { ...headers, Origin: 'https://evil.example' },
       })
     ).status,
@@ -89,61 +85,41 @@ test('control state reports Telegram only once the token and chat list are saved
   const telegramAddress = telegramApi.address();
   if (!telegramAddress || typeof telegramAddress === 'string')
     throw new Error('Expected TCP address');
-  const { service, config } = await httpFixture(t, undefined, {
+  const { service, control } = await httpFixture(t, undefined, {
     telegramApiBase: `http://127.0.0.1:${telegramAddress.port}`,
   });
   t.after(() => {
     telegramApi.closeAllConnections();
     telegramApi.close();
   });
-  const control = createServer((req, res) => {
-    service.controlApp(req, res);
-  });
-  await new Promise<void>((resolve) => control.listen(0, '127.0.0.1', resolve));
-  const address = control.address();
-  if (!address || typeof address === 'string') throw new Error('Expected TCP listener');
-  const base = `http://127.0.0.1:${address.port}`;
-  t.after(() => {
-    control.closeAllConnections();
-    return new Promise<void>((resolve, reject) =>
-      control.close((error) => (error ? reject(error) : resolve())),
-    );
-  });
-
-  const admin = { Authorization: `Bearer ${config.adminToken}` };
-  assert.equal((await fetch(`${base}/_control/api/state`)).status, 401);
-
-  const before = await jsonBody(await fetch(`${base}/_control/api/state`, { headers: admin }));
+  const before = await jsonBody(await control('/_control/api/state'));
   assert.deepEqual(before.telegram, { ok: false, message: 'Not configured' });
   assert.equal(before.telegramControl, false);
 
   // Token alone is not enough: without an allowed chat there is nobody to answer.
-  await fetch(`${base}/_control/api/settings`, {
+  await control('/_control/api/settings', {
     method: 'PATCH',
-    headers: { ...admin, 'Content-Type': 'application/json' },
     body: JSON.stringify({ telegram: { token: '123456:TEST', allowedChats: [] } }),
   });
-  const tokenOnly = await jsonBody(await fetch(`${base}/_control/api/state`, { headers: admin }));
+  const tokenOnly = await jsonBody(await control('/_control/api/state'));
   assert.equal(tokenOnly.telegramControl, false, 'a token without chats must not report control');
 
-  await fetch(`${base}/_control/api/settings`, {
+  await control('/_control/api/settings', {
     method: 'PATCH',
-    headers: { ...admin, 'Content-Type': 'application/json' },
     body: JSON.stringify({ telegram: { token: '123456:TEST', allowedChats: ['42'] } }),
   });
   await service.telegram?.check();
-  const ready = await jsonBody(await fetch(`${base}/_control/api/state`, { headers: admin }));
+  const ready = await jsonBody(await control('/_control/api/state'));
   assert.equal(ready.telegramControl, true, 'saving the token must not require a restart');
   assert.equal((ready.telegram as { ok: boolean }).ok, true);
   assert.equal((ready.telegram as { username: string }).username, 'tmcp_test');
 
   // Clearing the chats must take the bot back offline without a restart.
-  await fetch(`${base}/_control/api/settings`, {
+  await control('/_control/api/settings', {
     method: 'PATCH',
-    headers: { ...admin, 'Content-Type': 'application/json' },
     body: JSON.stringify({ telegram: { token: '', allowedChats: [] } }),
   });
-  const cleared = await jsonBody(await fetch(`${base}/_control/api/state`, { headers: admin }));
+  const cleared = await jsonBody(await control('/_control/api/state'));
   assert.equal(cleared.telegramControl, false);
   assert.equal((cleared.telegram as { status: string }).status, 'incomplete');
 });

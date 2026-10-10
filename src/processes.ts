@@ -12,6 +12,7 @@ import { promisify } from 'node:util';
 import { childEnvironment, type Config } from './config.js';
 import { errorMessage, isErrno } from './utils.js';
 import type { Workspace } from './workspace.js';
+import { windowsPowerShell } from './windows.js';
 
 export type Shell = 'powershell' | 'cmd' | 'bash' | 'sh';
 
@@ -19,7 +20,7 @@ export function shellInvocation(command: string, shell: Shell): [string, string[
   if (shell === 'powershell') {
     const script = `$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); $OutputEncoding=[Console]::OutputEncoding; $global:LASTEXITCODE=0;\n${command}\nif ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }`;
     return [
-      'powershell.exe',
+      process.platform === 'win32' ? windowsPowerShell() : 'powershell.exe',
       [
         '-NoLogo',
         '-NoProfile',
@@ -34,8 +35,9 @@ export function shellInvocation(command: string, shell: Shell): [string, string[
 }
 
 export async function terminateTree(child: ChildProcess): Promise<void> {
-  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+  if (!child.pid) return;
   if (process.platform === 'win32') {
+    if (child.exitCode !== null || child.signalCode !== null) return;
     try {
       await promisify(execFile)('taskkill.exe', ['/pid', String(child.pid), '/t', '/f'], {
         windowsHide: true,
@@ -46,10 +48,12 @@ export async function terminateTree(child: ChildProcess): Promise<void> {
     }
     return;
   }
+  // POSIX descendants can retain the group and stdio after their leader has exited.
   try {
     process.kill(-child.pid, 'SIGTERM');
   } catch (error) {
-    if (!isErrno(error, 'ESRCH')) throw error;
+    if (isErrno(error, 'ESRCH')) return;
+    throw error;
   }
   await delay(500);
   try {

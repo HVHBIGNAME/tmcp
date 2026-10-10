@@ -3,6 +3,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { errorMessage } from '../utils.js';
 import type { Gateway } from './gateway.js';
+import type { TrafficSpan } from '../traffic.js';
 
 const serverId = z.string().min(1).max(100).describe('Exact id returned by mcp_list_servers');
 const readonly = {
@@ -19,11 +20,23 @@ const mutable = {
 };
 const wait = z.number().int().min(0).max(10000).default(1000);
 
-export function registerGatewayTools(server: McpServer, gateway: Gateway, owner: string): void {
-  async function execute(operation: () => Promise<CallToolResult>): Promise<CallToolResult> {
+export function registerGatewayTools(
+  server: McpServer,
+  gateway: Gateway,
+  owner: string,
+  traffic?: TrafficSpan,
+): void {
+  async function execute(
+    operation: () => Promise<CallToolResult>,
+    target?: string,
+  ): Promise<CallToolResult> {
+    traffic?.running(undefined, target);
     try {
-      return await operation();
+      const result = await operation();
+      traffic?.result(Boolean(result.isError));
+      return result;
     } catch (error) {
+      traffic?.result(true);
       return { isError: true, content: [{ type: 'text', text: errorMessage(error) }] };
     }
   }
@@ -40,7 +53,7 @@ export function registerGatewayTools(server: McpServer, gateway: Gateway, owner:
     name: string,
     operation: () => Promise<Record<string, unknown>>,
     waitMs = 1000,
-  ) => execute(() => gateway.catalogCall(owner, id, name, operation, waitMs));
+  ) => execute(() => gateway.catalogCall(owner, id, name, operation, waitMs), `${id} · ${name}`);
 
   server.registerTool(
     'mcp_list_servers',
@@ -91,8 +104,9 @@ export function registerGatewayTools(server: McpServer, gateway: Gateway, owner:
       annotations: mutable,
     },
     (args) =>
-      execute(() =>
-        gateway.callTool(owner, args.server_id, args.tool, args.arguments, args.wait_ms),
+      execute(
+        () => gateway.callTool(owner, args.server_id, args.tool, args.arguments, args.wait_ms),
+        `${args.server_id} · ${args.tool}`,
       ),
   );
 
@@ -216,14 +230,16 @@ export function registerGatewayTools(server: McpServer, gateway: Gateway, owner:
         annotations: tool.original.annotations ?? mutable,
       },
       (args) =>
-        execute(() =>
-          gateway.callTool(
-            owner,
-            tool.serverId,
-            tool.original.name,
-            z.record(z.string(), z.unknown()).parse(args),
-            1000,
-          ),
+        execute(
+          () =>
+            gateway.callTool(
+              owner,
+              tool.serverId,
+              tool.original.name,
+              z.record(z.string(), z.unknown()).parse(args),
+              1000,
+            ),
+          `${tool.serverId} · ${tool.original.name}`,
         ),
     );
   }

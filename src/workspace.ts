@@ -3,9 +3,16 @@ import path from 'node:path';
 import { isErrno } from './utils.js';
 
 export class Workspace {
-  private constructor(readonly roots: string[]) {}
+  private constructor(
+    readonly roots: string[],
+    /**
+     * Private configuration, credential stores and IPC endpoints remain protected even
+     * when a workspace root contains the installation or the system temporary directory.
+     */
+    readonly privatePaths: string[],
+  ) {}
 
-  static async open(roots: string[]): Promise<Workspace> {
+  static async open(roots: string[], privatePaths: string[] = []): Promise<Workspace> {
     const canonical = await Promise.all(
       roots.map(async (root) => {
         const resolved = await realpath(root);
@@ -16,7 +23,19 @@ export class Workspace {
       }),
     );
     if (!canonical.length) throw new Error('At least one workspace root is required');
-    return new Workspace([...new Set(canonical)]);
+    const privatePaths_ = await Promise.all(
+      privatePaths.map(async (target) => {
+        const absolute = path.resolve(target);
+        try {
+          return await realpath(absolute);
+        } catch (error) {
+          // A credential file that does not exist yet cannot be read either.
+          if (isErrno(error, 'ENOENT')) return absolute;
+          throw error;
+        }
+      }),
+    );
+    return new Workspace([...new Set(canonical)], [...new Set(privatePaths_)]);
   }
 
   contains(candidate: string): boolean {
@@ -29,7 +48,29 @@ export class Workspace {
     });
   }
 
+  /** True when the path is a credential file itself or lives inside a credential directory. */
+  isPrivate(candidate: string): boolean {
+    const inside = (parent: string, child: string) => {
+      const value = path.relative(parent, child);
+      return (
+        value === '' ||
+        (value !== '..' && !value.startsWith(`..${path.sep}`) && !path.isAbsolute(value))
+      );
+    };
+    return this.privatePaths.some((target) => inside(target, candidate));
+  }
+
   assertMutable(candidate: string): void {
+    if (
+      this.privatePaths.some((target) => {
+        const relative = path.relative(candidate, target);
+        return (
+          relative === '' ||
+          (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
+        );
+      })
+    )
+      throw new Error('A directory containing server credentials cannot be deleted or moved');
     if (
       this.roots.some((root) => {
         const relative = path.relative(candidate, root);
@@ -67,7 +108,10 @@ export class Workspace {
     if (!this.contains(absolute)) throw new Error('Path is outside MCP_ROOTS');
     if (!followLeaf && !this.roots.some((root) => path.relative(root, absolute) === '')) {
       const parent = await this.resolve(path.dirname(absolute));
-      return path.join(parent, path.basename(absolute));
+      const leaf = path.join(parent, path.basename(absolute));
+      if (this.isPrivate(leaf))
+        throw new Error('Server credentials cannot be modified through MCP tools');
+      return leaf;
     }
     let ancestor = absolute;
     const missing: string[] = [];
@@ -75,6 +119,11 @@ export class Workspace {
       try {
         const canonical = path.join(await realpath(ancestor), ...missing.reverse());
         if (!this.contains(canonical)) throw new Error('Symlink or junction escapes MCP_ROOTS');
+        if (this.isPrivate(canonical)) {
+          throw new Error(
+            'This file holds server credentials and is not readable through MCP tools',
+          );
+        }
         return canonical;
       } catch (error) {
         if (!isErrno(error, 'ENOENT')) throw error;

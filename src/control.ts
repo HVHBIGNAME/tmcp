@@ -8,29 +8,29 @@ import type { SettingsStore } from './settings.js';
 import type { Telegram } from './telegram.js';
 import type { TokenStore } from './auth/tokens.js';
 import { permissionLabels, permissions, type Permission } from './permissions.js';
-import { generateSecret, rotateEnvToken, type OwnerSecrets } from './secrets.js';
-import { errorMessage, secretEqual } from './utils.js';
+import { errorMessage } from './utils.js';
 import type { ConnectionView } from './connection.js';
 import type { Logger } from './tools.js';
 import type { AutostartControl } from './autostart.js';
+import type { Traffic, TrafficEvent } from './traffic.js';
+import { version } from './version.js';
 
 export interface ControlServices {
   tokens: TokenStore;
   approvals: Approvals;
   audit: AuditLog;
+  traffic: Traffic;
   settings: SettingsStore;
   gateway: Gateway;
   processes: Processes;
   /** Read lazily: the transport is rebuilt when the token changes at runtime. */
   telegram?: () => Telegram | undefined;
-  owner: OwnerSecrets;
   publicUrl: () => string;
   connection: () => ConnectionView;
   capabilities: { shell: boolean; screenshots: boolean };
   log: Logger;
   autostart: AutostartControl;
   startedAt: string;
-  rotateToken: (kind: 'owner' | 'admin', current: string) => Promise<string>;
   restartTunnel: (mode: 'quick' | 'named') => Promise<{ url: string }>;
   restartServer: () => void;
   /** Rebuilds the Telegram transport after the token or chat list changes at runtime. */
@@ -39,32 +39,14 @@ export interface ControlServices {
 
 const idParam = z.string().uuid();
 
-/**
- * Local control API used by the desktop UI.
- *
- * The listener is loopback-only and every route requires the admin secret, which the
- * UI reads from the environment at startup. These endpoints can rotate credentials and
- * stop the server, so they are never exposed through the tunnel: the public router
- * rejects any path under this prefix.
- */
+/** Mount only behind the OS-protected IPC listener. */
 export function controlRouter(services: ControlServices): Router {
   const router = Router();
-  router.use((req, res, next) => {
-    const header = req.headers.authorization ?? '';
-    const match = /^Bearer ([A-Za-z0-9_-]{1,512})$/i.exec(header);
-    if (!match?.[1] || !secretEqual(match[1], services.owner.adminToken)) {
-      res.status(401).json({
-        error: 'unauthorized',
-        message: 'Сессия управления истекла. Подключаемся заново.',
-      });
-      return;
-    }
-    next();
-  });
 
   router.get('/state', (_req, res) => {
     const gateway = services.gateway.listServers();
     res.json({
+      version,
       publicUrl: services.publicUrl(),
       connection: services.connection(),
       capabilities: services.capabilities,
@@ -80,12 +62,41 @@ export function controlRouter(services: ControlServices): Router {
       })),
       jobs: services.processes.listAll(),
       activity: services.audit.tail(5),
+      traffic: services.traffic.snapshot(),
       telegramControl: Boolean(services.telegram?.()?.describe().ok),
     });
   });
 
+  router.get('/events', (_req, res) => {
+    const send = (event: TrafficEvent) => {
+      if (res.destroyed || res.writableEnded) return;
+      if (res.writableLength > 256 * 1024) {
+        res.end();
+        return;
+      }
+      res.write(`data: ${JSON.stringify(event)}\n\n`);
+    };
+    const unsubscribe = services.traffic.subscribe(send, () => res.end());
+    res
+      .set({
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-store',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      })
+      .flushHeaders();
+    send(services.traffic.snapshot());
+    const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 15000);
+    heartbeat.unref();
+    res.once('close', () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+    });
+  });
+
   router.get('/audit', (req, res) => {
-    const limit = Math.min(Number(req.query.limit ?? 200) || 200, 1000);
+    const requested = Number(req.query.limit ?? 200);
+    const limit = Number.isFinite(requested) ? Math.min(Math.max(1, requested), 1000) : 200;
     res.json({ entries: services.audit.tail(limit) });
   });
 
@@ -169,6 +180,16 @@ export function controlRouter(services: ControlServices): Router {
         signal: AbortSignal.timeout(10000),
         redirect: 'error',
       });
+      if (!response.ok) {
+        await response.body?.cancel();
+        res.json({
+          ok: false,
+          httpStatus: response.status,
+          checkedAt: new Date().toISOString(),
+          message: `Внешний адрес вернул HTTP ${response.status}. Проверьте туннель и повторите проверку.`,
+        });
+        return;
+      }
       const body = (await response.json()) as { status?: string; service?: string };
       const ok = response.ok && body.status === 'ok' && body.service === 'pc-mcp-tunnel';
       res.json({
@@ -192,35 +213,6 @@ export function controlRouter(services: ControlServices): Router {
     const action = z.enum(['allow', 'deny']).parse(req.params.action);
     const remember = req.body?.remember === true;
     res.json(services.approvals.respond(idParam.parse(req.params.id), action, remember));
-  });
-
-  router.post('/owner-token/rotate', async (req, res) => {
-    const current = z.string().min(1).parse(req.body?.current);
-    if (!secretEqual(current, services.owner.bearerToken)) {
-      res.status(403).json({ error: 'The current token does not match' });
-      return;
-    }
-    res.json({ token: await services.rotateToken('owner', current) });
-  });
-
-  router.post('/admin-token/rotate', async (req, res) => {
-    const current = z.string().min(1).parse(req.body?.current);
-    if (!secretEqual(current, services.owner.adminToken)) {
-      res.status(403).json({ error: 'The current token does not match' });
-      return;
-    }
-    res.json({ token: await services.rotateToken('admin', current) });
-  });
-
-  router.post('/secret/generate', (_req, res) => {
-    res.json({ token: generateSecret() });
-  });
-
-  router.post('/env/apply', async (req, res) => {
-    const input = z
-      .object({ ownerToken: z.string().optional(), adminToken: z.string().optional() })
-      .parse(req.body ?? {});
-    res.json(await rotateEnvToken(services.owner.envFile, input));
   });
 
   router.post('/tunnel/restart', async (req, res) => {

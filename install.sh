@@ -41,15 +41,17 @@ if [ -z "$NODE" ]; then
   NODE="$HOME_DIR/runtime/bin/node"
 fi
 export PATH="$(dirname "$NODE"):$PATH"
-if [ "$VERSION" = latest ]; then BASE="https://github.com/$REPO/releases/latest/download"; else BASE="https://github.com/$REPO/releases/download/$VERSION"; fi
-download "$BASE/SHA256SUMS.txt" "$TMP/SHA256SUMS.txt"
-download "$BASE/tmcp-core.tar.gz" "$TMP/tmcp-core.tar.gz"
-EXPECTED="$(awk '$2 == "tmcp-core.tar.gz" {print $1}' "$TMP/SHA256SUMS.txt")"
-verify "$TMP/tmcp-core.tar.gz" "$EXPECTED"
-
-# Archives contain application files only, never .env or .mcp-tunnel.
-tar -xzf "$TMP/tmcp-core.tar.gz" -C "$HOME_DIR"
-npm --prefix "$HOME_DIR" ci --omit=dev --no-audit --no-fund
+if [ "$VERSION" = latest ]; then
+  RELEASE_URL="$(curl --fail --silent --show-error --location --connect-timeout 20 --max-time 60 -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest")"
+  VERSION="${RELEASE_URL##*/}"
+fi
+case "$VERSION" in *[!a-zA-Z0-9._-]*|'') printf 'Invalid release tag.\n' >&2; exit 1 ;; esac
+# Unix builds the tagged source; the sole release asset is the Windows EXE.
+download "https://codeload.github.com/$REPO/tar.gz/refs/tags/$VERSION" "$TMP/source.tar.gz"
+tar -xzf "$TMP/source.tar.gz" -C "$HOME_DIR" --strip-components=1
+npm --prefix "$HOME_DIR" ci --no-audit --no-fund
+npm --prefix "$HOME_DIR" run build
+npm --prefix "$HOME_DIR" prune --omit=dev --no-audit --no-fund
 "$NODE" "$HOME_DIR/dist/src/cli.js" setup --root "${TMCP_ROOT:-$HOME}"
 "$NODE" "$HOME_DIR/scripts/install-runtime.mjs"
 mkdir -p "$HOME_DIR/bin"

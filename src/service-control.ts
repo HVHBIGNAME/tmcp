@@ -5,18 +5,22 @@ import path from 'node:path';
 import os from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
 import { config as dotenv } from 'dotenv';
-import { readConfig, type Config } from './config.js';
-import { atomicWrite, isErrno, token } from './utils.js';
+import { configurationFile, readConfig, type Config } from './config.js';
+import { atomicWrite, isErrno } from './utils.js';
 import { isAlive } from './runtime.js';
+import { ipcFetch } from './ipc.js';
+import { migrateLegacyAuth } from './migration.js';
 
 export async function initialize(
   projectDir: string,
   root = os.homedir(),
   port = 18787,
 ): Promise<void> {
-  await mkdir(path.join(projectDir, '.mcp-tunnel'), { recursive: true, mode: 0o700 });
+  const envFile = configurationFile(projectDir);
+  await mkdir(path.join(path.dirname(envFile), '.mcp-tunnel'), { recursive: true, mode: 0o700 });
   try {
-    await access(path.join(projectDir, '.env'));
+    await access(envFile);
+    await migrateLegacyAuth(envFile);
     return;
   } catch (error) {
     if (!isErrno(error, 'ENOENT')) throw error;
@@ -24,30 +28,28 @@ export async function initialize(
   const workspace = await realpath(root);
   const text = [
     `MCP_PORT=${port}`,
-    'MCP_CONTROL_PORT=18790',
-    `MCP_TOKEN=${token()}`,
-    `MCP_ADMIN_TOKEN=${token()}`,
     `MCP_ROOTS=${JSON.stringify([workspace.split(path.sep).join('/')])}`,
     'MCP_ENABLE_SHELL=true',
-    'MCP_ENABLE_SCREENSHOTS=true',
+    `MCP_ENABLE_SCREENSHOTS=${process.platform !== 'linux' || Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY)}`,
     'MCP_GATEWAY_DISCOVER=true',
     'MCP_GATEWAY_MODE=catalog',
     '',
   ].join('\n');
-  await writeFile(path.join(projectDir, '.env'), text, { flag: 'wx', mode: 0o600 });
+  await writeFile(envFile, text, { flag: 'wx', mode: 0o600 });
 }
 
 export function configAt(projectDir: string): Config {
   const env: NodeJS.ProcessEnv = { ...process.env };
-  dotenv({ path: path.join(projectDir, '.env'), processEnv: env, quiet: true });
+  dotenv({ path: configurationFile(projectDir, env), processEnv: env, quiet: true });
   return readConfig(env, projectDir);
 }
 
 export async function control(config: Config, route: string, method = 'GET', body?: unknown) {
-  const response = await fetch(`http://127.0.0.1:${config.controlPort}/_control/api${route}`, {
+  const response = await ipcFetch(config.dataDir, `/_control/api${route}`, {
     method,
-    signal: AbortSignal.timeout(route.includes('tunnel') ? 105000 : 15000),
-    headers: { Authorization: `Bearer ${config.adminToken}`, 'Content-Type': 'application/json' },
+    signal: AbortSignal.timeout(
+      route.includes('tunnel') ? 105000 : route === '/autostart' ? 60000 : 15000,
+    ),
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const data = response.status === 204 ? null : await response.json();
@@ -57,8 +59,7 @@ export async function control(config: Config, route: string, method = 'GET', bod
 
 export async function serviceStatus(config: Config): Promise<Record<string, unknown> | null> {
   try {
-    const response = await fetch(`${config.localUrl}/_control/status`, {
-      headers: { Authorization: `Bearer ${config.adminToken}` },
+    const response = await ipcFetch(config.dataDir, '/_control/status', {
       signal: AbortSignal.timeout(2500),
     });
     if (!response.ok) return null;
@@ -117,14 +118,16 @@ export async function stopService(config: Config): Promise<void> {
   await atomicWrite(path.join(config.dataDir, 'stop.request'), new Date().toISOString());
   const status = await serviceStatus(config);
   if (status) {
-    const response = await fetch(`${config.localUrl}/_control/shutdown`, {
+    // The supervisor also reacts to stop.request, so it may close the server first. A failed
+    // transport is then the expected outcome and the wait below confirms the real result.
+    const response = await ipcFetch(config.dataDir, '/_control/shutdown', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${config.adminToken}` },
       signal: AbortSignal.timeout(5000),
-    });
-    if (!response.ok) throw new Error(`Stop failed: HTTP ${response.status}`);
+    }).catch(() => undefined);
+    if (response && !response.ok) throw new Error(`Stop failed: HTTP ${response.status}`);
   }
-  for (let attempt = 0; attempt < 60; attempt++) {
+  const deadline = performance.now() + 15000;
+  while (performance.now() < deadline) {
     if (!(await serviceStatus(config)) && !(await supervisorAlive(config))) return;
     await delay(300);
   }

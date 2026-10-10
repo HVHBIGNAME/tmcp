@@ -3,7 +3,6 @@ import test from 'node:test';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { access, readFile, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:http';
 import path from 'node:path';
 import { fixture, httpFixture } from './helpers.js';
 
@@ -22,32 +21,21 @@ test('CLI help runs without configuration and setup preserves existing keys', as
   await run('setup', '--root', root, '--port', '19876');
   const first = await readFile(path.join(directory, '.env'), 'utf8');
   assert.match(first, /MCP_PORT=19876/);
-  assert.match(first, /MCP_TOKEN=[A-Za-z0-9_-]{40,}/);
+  assert.doesNotMatch(first, /MCP_(TOKEN|ADMIN_TOKEN|CONTROL_PORT)=/);
   await run('setup', '--root', directory, '--port', '19877');
   assert.equal(await readFile(path.join(directory, '.env'), 'utf8'), first);
 });
 
-test('CLI creates, lists, disables and deletes keys through the isolated control API', async (t) => {
+test('CLI creates, lists, disables and deletes keys through protected IPC', async (t) => {
   const base = await fixture(t);
   const instance = await httpFixture(t, base.config, {
     status: () => ({ service: 'pc-mcp-tunnel', ready: true, pid: process.pid }),
-  });
-  const controlServer = createServer(instance.service.controlApp);
-  await new Promise<void>((resolve) => controlServer.listen(0, '127.0.0.1', resolve));
-  const address = controlServer.address();
-  if (!address || typeof address === 'string') throw new Error('Expected TCP address');
-  t.after(() => {
-    controlServer.closeAllConnections();
-    controlServer.close();
   });
   const config = instance.config;
   await writeFile(
     path.join(base.directory, '.env'),
     [
       `MCP_PORT=${config.port}`,
-      `MCP_CONTROL_PORT=${address.port}`,
-      `MCP_TOKEN=${config.bearerToken}`,
-      `MCP_ADMIN_TOKEN=${config.adminToken}`,
       `MCP_ROOTS=${JSON.stringify([base.root.replaceAll('\\', '/')])}`,
       `MCP_DATA_DIR=${config.dataDir.replaceAll('\\', '/')}`,
     ].join('\n'),
@@ -66,5 +54,8 @@ test('CLI creates, lists, disables and deletes keys through the isolated control
   await run('token', 'disable', created.id);
   assert.equal(instance.service.tokens.find(created.token), undefined);
   await run('token', 'delete', created.id, '--yes');
-  assert.equal(instance.service.tokens.list().length, 0);
+  assert.equal(
+    instance.service.tokens.list().some((record) => record.id === created.id),
+    false,
+  );
 });

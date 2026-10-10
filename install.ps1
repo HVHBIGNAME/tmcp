@@ -9,61 +9,52 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$Repo = 'HVHBIGNAME/tmcp'
+if (-not [Environment]::Is64BitOperatingSystem) { throw 'TMCP requires 64-bit Windows.' }
+if ($Version -notmatch '^(latest|v[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?)$') { throw 'Invalid release tag.' }
 if ($Mode -eq 'auto') {
-    $Desktop = [Environment]::UserInteractive -and ((Get-CimInstance Win32_OperatingSystem).ProductType -eq 1)
-    $Mode = if ($Desktop) { 'gui' } else { 'cli' }
+    $Mode = if ([Environment]::UserInteractive -and (Get-CimInstance Win32_OperatingSystem).ProductType -eq 1) { 'gui' } else { 'cli' }
 }
+$InstallDir = [IO.Path]::GetFullPath($InstallDir)
 $Temp = Join-Path ([IO.Path]::GetTempPath()) ('tmcp-install-' + [guid]::NewGuid().ToString('N'))
+$Utf8 = New-Object Text.UTF8Encoding $false
 New-Item -ItemType Directory -Path $Temp, $InstallDir -Force | Out-Null
-function Download([string]$Url, [string]$Target) { Invoke-WebRequest -Uri $Url -OutFile $Target -UseBasicParsing -TimeoutSec 180 }
-function Verify([string]$File, [string]$Hash) {
-    if (-not $Hash -or (Get-FileHash -LiteralPath $File -Algorithm SHA256).Hash -ne $Hash) { throw "Checksum verification failed: $File" }
-}
-function RunNode([string[]]$Arguments) { & $script:Node @Arguments; if ($LASTEXITCODE -ne 0) { throw 'TMCP command failed.' } }
 try {
-    "TMCP - setup for Windows ($Mode)"
-    $Node = $null
-    $Command = Get-Command node.exe -ErrorAction SilentlyContinue
-    if ($Command) {
-        $NodeVersion = & $Command.Source --version
-        if ($LASTEXITCODE -eq 0 -and [version]$NodeVersion.Trim().TrimStart('v') -ge [version]'22.16.0') { $Node = $Command.Source }
+    $Api = if ($Version -eq 'latest') { 'latest' } else { "tags/$Version" }
+    $Release = Invoke-RestMethod "https://api.github.com/repos/HVHBIGNAME/tmcp/releases/$Api" -TimeoutSec 60
+    $Asset = $Release.assets | Where-Object { $_.name -eq 'TMCP.exe' }
+    if (-not $Asset -or $Asset.digest -notmatch '^sha256:([a-f0-9]{64})$') { throw 'Select a TMCP 2.0+ release with a verified TMCP.exe asset.' }
+    $Digest = $Matches[1]
+    'Downloading the standalone TMCP.exe...'
+    Invoke-WebRequest $Asset.browser_download_url -OutFile "$Temp\TMCP.exe" -UseBasicParsing -TimeoutSec 600
+    if ((Get-FileHash "$Temp\TMCP.exe" -Algorithm SHA256).Hash -ne $Digest) { throw 'TMCP.exe checksum mismatch.' }
+    $Executable = Join-Path $InstallDir 'TMCP.exe'
+    Copy-Item -LiteralPath "$Temp\TMCP.exe" -Destination $Executable -Force
+    $EnvFile = Join-Path $InstallDir '.env'
+    if (-not (Test-Path -LiteralPath $EnvFile)) {
+        $Roots = ConvertTo-Json -InputObject @((Resolve-Path -LiteralPath $Root).Path.Replace('\', '/')) -Compress
+        [IO.File]::WriteAllText($EnvFile, "MCP_PORT=18787`nMCP_ROOTS=$Roots`nMCP_ENABLE_SHELL=true`nMCP_ENABLE_SCREENSHOTS=true`nMCP_GATEWAY_DISCOVER=true`nMCP_GATEWAY_MODE=catalog`n", $Utf8)
     }
-    if (-not $Node) {
-        'Installing a private Node.js 24 LTS runtime...'
-        Download 'https://nodejs.org/dist/latest-v24.x/SHASUMS256.txt' "$Temp\node-sums.txt"
-        $Entry = (Get-Content -LiteralPath "$Temp\node-sums.txt" | Where-Object { $_ -match '\snode-v[\d.]+-win-x64.zip$' })
-        if (-not $Entry) { throw 'No compatible Node.js download found.' }
-        $Parts = $Entry.Trim() -split '\s+'
-        Download "https://nodejs.org/dist/latest-v24.x/$($Parts[1])" "$Temp\node.zip"
-        Verify "$Temp\node.zip" $Parts[0]
-        Expand-Archive -LiteralPath "$Temp\node.zip" -DestinationPath "$Temp\node"
-        $NodeFolder = Get-ChildItem -LiteralPath "$Temp\node" -Directory
-        New-Item -ItemType Directory -Path "$InstallDir\runtime" -Force | Out-Null
-        Copy-Item -Path "$($NodeFolder.FullName)\*" -Destination "$InstallDir\runtime" -Recurse -Force
-        $Node = "$InstallDir\runtime\node.exe"
-    }
-    $env:PATH = "$(Split-Path -Parent $Node);$env:PATH"
-    $Base = if ($Version -eq 'latest') { "https://github.com/$Repo/releases/latest/download" } else { "https://github.com/$Repo/releases/download/$Version" }
-    Download "$Base/SHA256SUMS.txt" "$Temp\SHA256SUMS.txt"
-    $Sums = Get-Content -LiteralPath "$Temp\SHA256SUMS.txt"
-    $Assets = @('tmcp-core.zip')
-    if ($Mode -eq 'gui') { $Assets += 'tmcp-windows-x64.zip' }
-    foreach ($Asset in $Assets) {
-        Download "$Base/$Asset" "$Temp\$Asset"
-        $Entry = $Sums | Where-Object { ($_ -split '\s+')[1] -eq $Asset }
-        Verify "$Temp\$Asset" (($Entry -split '\s+')[0])
-        Expand-Archive -LiteralPath "$Temp\$Asset" -DestinationPath $InstallDir -Force
-    }
-    & npm.cmd --prefix $InstallDir ci --omit=dev --no-audit --no-fund
-    if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
-    RunNode @("$InstallDir\dist\src\cli.js", 'setup', '--root', $Root)
-    $RuntimeArgs = @("$InstallDir\scripts\install-runtime.mjs")
-    if ($Mode -eq 'gui') { $RuntimeArgs += '--gui' }
-    RunNode $RuntimeArgs
-    New-Item -ItemType Directory -Path "$InstallDir\bin" -Force | Out-Null
-    $Wrapper = "@echo off`r`n`"$Node`" `"$InstallDir\dist\src\cli.js`" %*`r`n"
-    [IO.File]::WriteAllText("$InstallDir\bin\tmcp.cmd", $Wrapper, [Text.Encoding]::Default)
+    $Prepare = Start-Process -FilePath $Executable -ArgumentList @('--prepare-only', '--home', ('"' + $InstallDir.TrimEnd('\') + '"')) -PassThru -Wait
+    if ($Prepare.ExitCode -ne 0) { throw 'Component preparation failed. See .mcp-tunnel/ui-error.log.' }
+    $App = Get-Content -LiteralPath "$InstallDir\application.json" -Raw | ConvertFrom-Json
+    New-Item -ItemType Directory -Path "$InstallDir\bin", $App.data -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $App.data 'install.json'), (ConvertTo-Json @{ mode = $Mode }), $Utf8)
+    $Wrapper = @'
+$ErrorActionPreference = 'Stop'
+$HomeDir = Split-Path -Parent $PSScriptRoot
+$App = Get-Content -LiteralPath (Join-Path $HomeDir 'application.json') -Raw | ConvertFrom-Json
+$env:MCP_ENV_FILE = $App.envFile
+$env:MCP_DATA_DIR = $App.data
+$env:MCP_DESKTOP_EXE = Join-Path $HomeDir 'TMCP.exe'
+$env:MCP_DESKTOP_MODE = (Get-Content -LiteralPath (Join-Path $App.data 'install.json') -Raw | ConvertFrom-Json).mode
+$env:CLOUDFLARED_BIN = Join-Path $App.project 'bin\cloudflared.exe'
+& $App.node $App.cli @args
+exit $LASTEXITCODE
+'@
+    [IO.File]::WriteAllText("$InstallDir\bin\tmcp.ps1", $Wrapper, $Utf8)
+    [IO.File]::WriteAllText("$InstallDir\bin\tmcp.cmd", "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File `"%~dp0tmcp.ps1`" %*`r`n", [Text.Encoding]::ASCII)
+    & "$InstallDir\bin\tmcp.cmd" setup --root $Root
+    if ($LASTEXITCODE -ne 0) { throw 'TMCP setup failed.' }
     if (-not $NoPathUpdate) {
         $UserPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
         if (($UserPath -split ';') -notcontains "$InstallDir\bin") { [Environment]::SetEnvironmentVariable('PATH', "$InstallDir\bin;$UserPath", 'User') }
@@ -71,19 +62,23 @@ try {
     if ($Mode -eq 'gui') {
         $Menu = Join-Path ([Environment]::GetFolderPath('Programs')) 'TMCP'
         New-Item -ItemType Directory -Path $Menu -Force | Out-Null
-        $Shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut("$Menu\PC MCP.lnk")
-        $Shortcut.TargetPath = "$InstallDir\dist-ui\PcMcp.exe"
+        $Shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut("$Menu\TMCP.lnk")
+        $Shortcut.TargetPath = $Executable
+        $Shortcut.Arguments = '--home "' + $InstallDir.TrimEnd('\') + '"'
         $Shortcut.WorkingDirectory = $InstallDir
-        $Shortcut.IconLocation = "$InstallDir\dist-ui\PcMcp.exe,0"
+        $Shortcut.IconLocation = "$Executable,0"
         $Shortcut.Save()
     }
-    if ($Autostart) { RunNode @("$InstallDir\dist\src\cli.js", 'autostart', 'on') }
+    if ($Autostart) {
+        & "$InstallDir\bin\tmcp.cmd" autostart on
+        if ($LASTEXITCODE -ne 0) { throw 'Autostart registration failed.' }
+    }
     if (-not $NoStart) {
-        if ($Mode -eq 'gui') { Start-Process -FilePath "$InstallDir\dist-ui\PcMcp.exe" -WorkingDirectory $InstallDir }
-        else { RunNode @("$InstallDir\dist\src\cli.js", 'start') }
+        $Launch = @('--home', ('"' + $InstallDir.TrimEnd('\') + '"'))
+        if ($Mode -eq 'cli') { $Launch += '--headless' }
+        Start-Process -FilePath $Executable -ArgumentList $Launch -WorkingDirectory $InstallDir
     }
     "Installed in $InstallDir. Open a new terminal and run: tmcp"
-    'Autostart is optional: tmcp autostart on'
 } finally {
-    Remove-Item -LiteralPath $Temp -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $Temp -Recurse -Force
 }

@@ -47,16 +47,10 @@ export class TunnelManager {
     return { ...this.config, publicUrl, tunnelToken };
   }
 
-  restart(mode: 'quick' | 'named'): Promise<string> {
-    if (this.abort.signal.aborted) return Promise.reject(new Error('The server is stopping'));
-    if (this.pending) return Promise.reject(new Error('A tunnel restart is already running'));
-    // Validate before taking the existing tunnel down.
-    let config: Config;
-    try {
-      config = this.launchConfig(mode);
-    } catch (error) {
-      return Promise.reject(error);
-    }
+  async restart(mode: 'quick' | 'named'): Promise<string> {
+    if (this.abort.signal.aborted) throw new Error('The server is stopping');
+    if (this.pending) throw new Error('A tunnel restart is already running');
+    const config = this.launchConfig(mode);
     this.mode = mode;
     clearTimeout(this.retry);
     this.retry = undefined;

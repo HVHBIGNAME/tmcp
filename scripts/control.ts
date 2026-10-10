@@ -7,6 +7,8 @@ import { loadConfig } from '../src/config.js';
 import { isAlive, runtimeSchema, type RuntimeInfo } from '../src/runtime.js';
 import { terminateTree } from '../src/processes.js';
 import { errorMessage } from '../src/utils.js';
+import { serviceStatus } from '../src/service-control.js';
+import { ipcFetch } from '../src/ipc.js';
 
 const { values, positionals } = parseArgs({
   allowPositionals: true,
@@ -18,7 +20,6 @@ if (!['up', 'down', 'status'].includes(action ?? ''))
 if (!['quick', 'named', 'local'].includes(values.mode))
   throw new Error('Mode must be quick, named or local');
 const config = loadConfig();
-const headers = { Authorization: `Bearer ${config.adminToken}` };
 
 async function liveStatus(): Promise<RuntimeInfo | undefined> {
   let health: Response;
@@ -47,23 +48,8 @@ async function liveStatus(): Promise<RuntimeInfo | undefined> {
       `Port ${config.port} is occupied by another service. Set a free MCP_PORT in .env.`,
     );
   }
-  let response: Response;
-  try {
-    response = await fetch(`${config.localUrl}/_control/status`, {
-      headers,
-      signal: AbortSignal.timeout(1500),
-    });
-  } catch (error) {
-    if (error instanceof TypeError || (error instanceof Error && error.name === 'TimeoutError'))
-      return undefined;
-    throw error;
-  }
-  if (response.status === 503) return undefined;
-  if (!response.ok)
-    throw new Error(
-      `Port ${config.port} is responding with HTTP ${response.status}; check .env credentials and the process on this port`,
-    );
-  return runtimeSchema.parse(await response.json());
+  const status = await serviceStatus(config);
+  return status ? runtimeSchema.parse(status) : undefined;
 }
 
 function printStatus(status: RuntimeInfo) {
@@ -71,7 +57,7 @@ function printStatus(status: RuntimeInfo) {
     JSON.stringify(
       {
         ...status,
-        credentials_file: path.join(config.projectDir, '.env'),
+        config_file: path.join(config.projectDir, '.env'),
         log_file: path.join(config.dataDir, 'server.log'),
       },
       null,
@@ -125,9 +111,8 @@ async function up() {
   } catch (error) {
     const status = await liveStatus();
     if (status && status.pid === child.pid)
-      await fetch(`${config.localUrl}/_control/shutdown`, {
+      await ipcFetch(config.dataDir, '/_control/shutdown', {
         method: 'POST',
-        headers,
         signal: AbortSignal.timeout(3000),
       });
     else await terminateTree(child);
@@ -141,9 +126,8 @@ async function down() {
     console.log('PC MCP gateway is not running on the configured port.');
     return;
   }
-  const response = await fetch(`${config.localUrl}/_control/shutdown`, {
+  const response = await ipcFetch(config.dataDir, '/_control/shutdown', {
     method: 'POST',
-    headers,
     signal: AbortSignal.timeout(5000),
   });
   if (!response.ok) throw new Error(`Shutdown failed: HTTP ${response.status}`);

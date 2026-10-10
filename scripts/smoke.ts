@@ -18,6 +18,9 @@ const { values } = parseArgs({
   },
 });
 const config = loadConfig();
+const key = process.env.TMCP_CHECK_KEY;
+if (!key)
+  throw new Error('Set TMCP_CHECK_KEY to a key issued in Access or with tmcp token create.');
 const url = new URL(values.url ?? `${config.localUrl}/mcp`);
 const unauthenticated = await fetch(url, {
   method: 'POST',
@@ -36,7 +39,7 @@ console.log('PASS authentication boundary and OAuth discovery');
 const client = new Client({ name: 'pc-mcp-smoke', version: '1.0.0' });
 await client.connect(
   new StreamableHTTPClientTransport(url, {
-    requestInit: { headers: { Authorization: `Bearer ${config.bearerToken}` } },
+    requestInit: { headers: { Authorization: `Bearer ${key}` } },
   }),
   { timeout: 20000 },
 );

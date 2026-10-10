@@ -53,11 +53,16 @@ export function button(label, glyph, action, variant = 'secondary') {
     } catch (error) {
       toast(error.message || 'Не удалось выполнить действие.', 'error');
     } finally {
-      node.disabled = false;
       node.removeAttribute('aria-busy');
+      setDisabled(node, node.dataset.unavailable === 'true');
     }
   });
   return node;
+}
+
+export function setDisabled(node, disabled) {
+  node.dataset.unavailable = String(disabled);
+  node.disabled = disabled || node.getAttribute('aria-busy') === 'true';
 }
 
 export function badge(text, tone = 'neutral') {
@@ -130,6 +135,17 @@ export function toggle(label, description, checked, onChange, disabled = false) 
   ]);
 }
 
+function freezeInputs(container) {
+  const fields = [...container.querySelectorAll('input, textarea, select')].map((node) => [
+    node,
+    node.disabled,
+  ]);
+  for (const [node] of fields) node.disabled = true;
+  return () => {
+    for (const [node, disabled] of fields) node.disabled = disabled;
+  };
+}
+
 export function formPanel(title, subtitle, build, save, label = 'Сохранить изменения') {
   const form = el('form', { className: 'settings-form', noValidate: true });
   const error = el('div', { className: 'inline-error', role: 'alert', hidden: true });
@@ -156,11 +172,8 @@ export function formPanel(title, subtitle, build, save, label = 'Сохрани�
     if (submit.disabled) return;
     submit.disabled = true;
     submit.setAttribute('aria-busy', 'true');
-    const fields = [...form.querySelectorAll('input, textarea, select')].map((node) => [
-      node,
-      node.disabled,
-    ]);
-    for (const [node] of fields) node.disabled = true;
+    status.textContent = 'Сохраняем…';
+    const restoreInputs = freezeInputs(form);
     error.hidden = true;
     try {
       await save(controls);
@@ -173,7 +186,7 @@ export function formPanel(title, subtitle, build, save, label = 'Сохрани�
     } finally {
       submit.disabled = false;
       submit.removeAttribute('aria-busy');
-      for (const [node, disabled] of fields) node.disabled = disabled;
+      restoreInputs();
       if (dirty) status.textContent = 'Изменения ещё не сохранены';
     }
   });
@@ -195,7 +208,7 @@ export function modal({
   const dialog = el('dialog', { className: 'dialog', 'aria-labelledby': `dialog-${++fieldId}` });
   const headingId = dialog.getAttribute('aria-labelledby');
   const form = el('form', { noValidate: true });
-  const error = el('div', { className: 'inline-error', role: 'alert', hidden: true });
+  const error = el('div', { className: 'inline-error', role: 'alert', tabIndex: -1, hidden: true });
   let pending = false;
   const close = () => {
     if (pending) return;
@@ -234,6 +247,7 @@ export function modal({
     submit.disabled = true;
     cancel.disabled = true;
     submit.setAttribute('aria-busy', 'true');
+    const restoreInputs = freezeInputs(form);
     error.hidden = true;
     try {
       const afterClose = await onSubmit();
@@ -248,6 +262,13 @@ export function modal({
       submit.disabled = false;
       cancel.disabled = false;
       submit.removeAttribute('aria-busy');
+      restoreInputs();
+      if (!error.hidden) {
+        const editable = form.querySelector(
+          'input:not([type="checkbox"]):not([type="hidden"]):not(:disabled), textarea:not(:disabled), select:not(:disabled)',
+        );
+        (editable ?? error).focus();
+      }
     }
   });
   dialog.addEventListener('cancel', (event) => {

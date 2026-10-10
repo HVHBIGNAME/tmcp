@@ -22,19 +22,21 @@ import {
 } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { redirectUriMatches } from '@modelcontextprotocol/sdk/server/auth/handlers/authorize.js';
 import type { Config } from '../config.js';
+import type { Permission } from '../permissions.js';
+import type { Logger } from '../tools.js';
 import { hash, secretEqual, token } from '../utils.js';
-import { consentPage } from './consent.js';
-import { AuthStore, type Grant } from './store.js';
+import { consentErrorPage, consentPage } from './consent.js';
+import { AuthStore, type Authorization, type Grant, type GrantBinding } from './store.js';
 
 export const scope = 'pc:access';
 const accessLifetime = 3600;
 const grantLifetime = 30 * 24 * 3600 * 1000;
+const authorizationLifetime = 30 * 60 * 1000;
 
-interface PendingAuthorization {
-  clientId: string;
-  params: AuthorizationParams;
-  expiresAt: number;
-  csrf: string;
+/** Resolves access tokens for authorization and re-checks the ones a grant is bound to. */
+export interface AccessBinding {
+  resolve(presented: string): GrantBinding | undefined;
+  verify(binding: GrantBinding): Permission[] | undefined;
 }
 
 function validateRedirect(uri: string): void {
@@ -54,12 +56,12 @@ function validateRedirect(uri: string): void {
 
 export class AuthProvider implements OAuthServerProvider {
   readonly clientsStore: OAuthRegisteredClientsStore;
-  private readonly pending = new Map<string, PendingAuthorization>();
-  private readonly codes = new Map<string, PendingAuthorization>();
 
   constructor(
     private readonly config: Config,
     private readonly store: AuthStore,
+    private readonly access: AccessBinding,
+    private readonly log: Logger = () => undefined,
   ) {
     this.clientsStore = {
       getClient: (id) => this.store.snapshot().clients.find((client) => client.client_id === id),
@@ -104,104 +106,169 @@ export class AuthProvider implements OAuthServerProvider {
       throw new InvalidTargetError('Unknown MCP resource');
   }
 
-  private prune(): void {
-    for (const entries of [this.pending, this.codes]) {
-      for (const [key, value] of entries) if (value.expiresAt <= Date.now()) entries.delete(key);
-    }
-  }
-
   async authorize(
     client: OAuthClientInformationFull,
     params: AuthorizationParams,
     res: Response,
   ): Promise<void> {
-    this.prune();
     this.validateResource(params.resource);
     if (!/^[A-Za-z0-9_-]{43}$/.test(params.codeChallenge))
       throw new InvalidRequestError('A valid S256 PKCE challenge is required');
     if (!client.redirect_uris.some((uri) => redirectUriMatches(params.redirectUri, uri)))
       throw new InvalidRequestError('Unregistered redirect URI');
-    const scopes = params.scopes?.length ? params.scopes : [scope];
-    if (scopes.some((requested) => requested !== scope))
-      throw new InvalidScopeError('Unknown scope');
-    if (this.pending.size >= 128) throw new TooManyRequestsError('Too many pending authorizations');
+    // Unknown scope names are dropped rather than refused: the grant only ever carries
+    // the scopes this server understands, so a client that bundles extras still works.
+    const requested = params.scopes?.filter((requested) => requested === scope) ?? [];
+    const scopes = requested.length ? requested : [scope];
     const id = token();
     const csrf = token();
-    const nonce = token();
-    this.pending.set(id, {
-      clientId: client.client_id,
-      params: { ...params, scopes, resource: new URL(this.resource) },
-      csrf,
-      expiresAt: Date.now() + 10 * 60 * 1000,
+    await this.store.transaction((draft) => {
+      if (Object.keys(draft.pending).length >= 128)
+        throw new TooManyRequestsError('Too many pending authorizations');
+      draft.pending[id] = {
+        clientId: client.client_id,
+        params: { ...params, scopes, resource: this.resource },
+        csrf,
+        expiresAt: Date.now() + authorizationLifetime,
+      };
     });
     res.cookie(this.cookieName(id), csrf, {
       httpOnly: true,
       secure: this.config.publicUrl.startsWith('https:'),
       sameSite: 'lax',
       path: '/oauth/approve',
-      maxAge: 10 * 60 * 1000,
+      maxAge: authorizationLifetime,
     });
-    res.set(
-      'Content-Security-Policy',
-      `default-src 'none'; style-src 'nonce-${nonce}'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`,
-    );
+    this.log({
+      event: 'oauth_consent_shown',
+      client: client.client_name ?? client.client_id,
+      client_id: client.client_id,
+    });
+    this.renderConsent(res, id, client.client_name ?? client.client_id, params.redirectUri);
+  }
+
+  private renderConsent(
+    res: Response,
+    id: string,
+    client: string,
+    redirectUri: string,
+    error?: string,
+  ): void {
+    const nonce = token();
     res
+      .status(error ? 401 : 200)
+      .set(
+        'Content-Security-Policy',
+        `default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; form-action 'self' ${new URL(redirectUri).origin}; frame-ancestors 'none'; base-uri 'none'`,
+      )
       .type('html')
-      .send(consentPage(id, client.client_name ?? client.client_id, params.redirectUri, nonce));
+      .send(consentPage(id, client, redirectUri, nonce, error));
   }
 
   private cookieName(id: string): string {
     return `pc_mcp_${id.slice(0, 16)}`;
   }
 
-  approve(req: Request, res: Response): void {
-    this.prune();
+  /** Renders a readable page in the browser instead of a raw JSON error. */
+  private refuse(res: Response, title: string, detail: string, status = 400): void {
+    const nonce = token();
+    res
+      .status(status)
+      .set(
+        'Content-Security-Policy',
+        `default-src 'none'; style-src 'nonce-${nonce}'; frame-ancestors 'none'; base-uri 'none'`,
+      )
+      .type('html')
+      .send(consentErrorPage(title, detail, nonce));
+  }
+
+  async approve(req: Request, res: Response): Promise<void> {
     const id: unknown = req.body?.request_id;
     if (typeof id !== 'string') throw new InvalidRequestError('Missing authorization request');
-    const pending = this.pending.get(id);
-    if (!pending)
-      throw new InvalidRequestError('Authorization expired; reconnect from the MCP client');
+    const pending = this.store.authorization('pending', id);
+    if (!pending || pending.params.resource !== this.resource) {
+      this.log({ event: 'oauth_consent_expired' });
+      this.refuse(
+        res,
+        'Подключение истекло',
+        'Эта вкладка уже не действует. Закройте её и нажмите «Подключить» в приложении ещё раз — откроется новая страница подтверждения.',
+      );
+      return;
+    }
     const prefix = `${this.cookieName(id)}=`;
     const cookie = req.headers.cookie
       ?.split(';')
       .map((part) => part.trim())
       .find((part) => part.startsWith(prefix))
       ?.slice(prefix.length);
-    if (!cookie || !secretEqual(cookie, pending.csrf))
-      throw new InvalidRequestError('Invalid browser session; restart authorization');
-    const denied = req.body?.deny === 'yes';
-    if (
-      !denied &&
-      (typeof req.body?.admin_token !== 'string' ||
-        !secretEqual(req.body.admin_token, this.config.adminToken))
-    ) {
-      res
-        .status(401)
-        .type('text')
-        .send('Неверный MCP_ADMIN_TOKEN. Вернитесь назад и повторите вход.');
+    if (!cookie || !secretEqual(cookie, pending.csrf)) {
+      this.log({ event: 'oauth_consent_rejected', reason: 'browser_session' });
+      this.refuse(
+        res,
+        'Сессия браузера не совпала',
+        'Форма подтверждения пришла не из того окна браузера, которое её открыло. Закройте эту вкладку и начните подключение заново из приложения.',
+      );
       return;
     }
-    this.pending.delete(id);
-    res.clearCookie(this.cookieName(id), { path: '/oauth/approve' });
-    const destination = new URL(pending.params.redirectUri);
-    if (denied) destination.searchParams.set('error', 'access_denied');
-    else {
-      const code = token();
-      this.codes.set(hash(code), { ...pending, expiresAt: Date.now() + 2 * 60 * 1000 });
-      destination.searchParams.set('code', code);
+    const denied = req.body?.deny === 'yes';
+    const presented: unknown = denied ? '' : req.body?.access_token;
+    const binding =
+      typeof presented === 'string' && presented ? this.access.resolve(presented) : undefined;
+    if (!denied && !binding) {
+      this.log({ event: 'oauth_consent_rejected', reason: 'token' });
+      const client = await this.clientsStore.getClient(pending.clientId);
+      this.renderConsent(
+        res,
+        id,
+        client?.client_name ?? pending.clientId,
+        pending.params.redirectUri,
+        'Введите действующий ключ из раздела «Доступ» и повторите подтверждение.',
+      );
+      return;
     }
+    const destination = new URL(pending.params.redirectUri);
+    const code = token();
+    try {
+      await this.store.transaction((draft) => {
+        if (!draft.pending[id] || draft.pending[id].params.resource !== this.resource)
+          throw new InvalidGrantError('Consent was already consumed');
+        if (!denied) {
+          if (!binding || !this.access.verify(binding))
+            throw new InvalidGrantError('The authorizing token is no longer active');
+          if (Object.keys(draft.codes).length >= 128)
+            throw new TooManyRequestsError('Too many pending authorization codes');
+          draft.codes[hash(code)] = {
+            ...pending,
+            binding,
+            expiresAt: Date.now() + 2 * 60 * 1000,
+          };
+        }
+        delete draft.pending[id];
+      });
+    } catch (error) {
+      if (!(error instanceof InvalidGrantError)) throw error;
+      this.refuse(res, 'Подключение истекло', 'Начните подключение заново из приложения.');
+      return;
+    }
+    res.clearCookie(this.cookieName(id), { path: '/oauth/approve' });
+    destination.searchParams.set(denied ? 'error' : 'code', denied ? 'access_denied' : code);
+    this.log({
+      event: denied ? 'oauth_consent_denied' : 'oauth_consent_approved',
+      client_id: pending.clientId,
+      token_name: binding?.name,
+    });
     if (pending.params.state !== undefined)
       destination.searchParams.set('state', pending.params.state);
     res.redirect(303, destination.href);
   }
 
-  private getCode(
-    client: OAuthClientInformationFull,
-    authorizationCode: string,
-  ): PendingAuthorization {
-    this.prune();
-    const pending = this.codes.get(hash(authorizationCode));
-    if (!pending || pending.clientId !== client.client_id)
+  private getCode(client: OAuthClientInformationFull, authorizationCode: string): Authorization {
+    const pending = this.store.authorization('codes', hash(authorizationCode));
+    if (
+      !pending ||
+      pending.clientId !== client.client_id ||
+      pending.params.resource !== this.resource
+    )
       throw new InvalidGrantError('Invalid or expired authorization code');
     return pending;
   }
@@ -220,33 +287,43 @@ export class AuthProvider implements OAuthServerProvider {
     redirectUri?: string,
     resource?: URL,
   ): Promise<OAuthTokens> {
-    const pending = this.getCode(client, authorizationCode);
     this.validateResource(resource);
-    if (
-      pending.params.resource?.href !== this.resource ||
-      (redirectUri !== undefined && redirectUri !== pending.params.redirectUri)
-    )
-      throw new InvalidGrantError('Authorization binding mismatch');
-    // No await before consumption: concurrent exchanges cannot redeem the same code twice.
-    this.codes.delete(hash(authorizationCode));
     const access = token();
     const refresh = token();
-    await this.store.transaction((draft) => {
+    const pending = await this.store.transaction((draft) => {
+      const pending = draft.codes[hash(authorizationCode)];
+      if (!pending || pending.clientId !== client.client_id)
+        throw new InvalidGrantError('Invalid or expired authorization code');
+      if (
+        pending.params.resource !== this.resource ||
+        (redirectUri !== undefined && redirectUri !== pending.params.redirectUri)
+      )
+        throw new InvalidGrantError('Authorization binding mismatch');
+      if (!pending.binding || !this.access.verify(pending.binding))
+        throw new InvalidGrantError('The authorizing token is no longer active');
       if (draft.grants.length >= 256)
         throw new TooManyRequestsError('Authorization capacity reached');
       draft.grants.push({
         id: token(),
         clientId: client.client_id,
-        scopes: pending.params.scopes ?? [scope],
+        scopes: pending.params.scopes,
         resource: this.resource,
         expiresAt: Date.now() + grantLifetime,
         accessHash: hash(access),
         accessExpiresAt: Date.now() + accessLifetime * 1000,
         refreshHash: hash(refresh),
         usedRefreshHashes: [],
+        binding: pending.binding,
       });
+      delete draft.codes[hash(authorizationCode)];
+      return pending;
     });
-    return this.tokens(access, refresh, pending.params.scopes ?? [scope]);
+    this.log({
+      event: 'oauth_grant_issued',
+      client_id: client.client_id,
+      token_name: pending.binding?.name,
+    });
+    return this.tokens(access, refresh, pending.params.scopes);
   }
 
   private tokens(access: string, refresh: string, scopes: string[]): OAuthTokens {
@@ -284,6 +361,8 @@ export class AuthProvider implements OAuthServerProvider {
           saved.resource === this.resource,
       );
       if (!grant) throw new InvalidGrantError('Invalid or expired refresh token');
+      if (!grant.binding || !this.access.verify(grant.binding))
+        throw new InvalidGrantError('The authorizing token is no longer active');
       if (scopes?.some((requested) => !grant.scopes.includes(requested)))
         throw new InvalidScopeError('Refresh cannot expand scopes');
       grant.usedRefreshHashes.push(grant.refreshHash);
@@ -306,15 +385,8 @@ export class AuthProvider implements OAuthServerProvider {
   }
 
   async verifyAccessToken(accessToken: string): Promise<AuthInfo> {
-    if (secretEqual(accessToken, this.config.bearerToken))
-      return {
-        token: accessToken,
-        clientId: 'static-token',
-        scopes: [scope],
-        resource: new URL(this.resource),
-      };
     const digest = hash(accessToken);
-    const grant = this.store.snapshot().grants.find((saved) => saved.accessHash === digest);
+    const grant = this.store.accessGrant(digest);
     if (
       !grant ||
       grant.expiresAt <= Date.now() ||
@@ -322,12 +394,23 @@ export class AuthProvider implements OAuthServerProvider {
       grant.resource !== this.resource
     )
       throw new InvalidTokenError('Invalid or expired access token');
+    const permissions = grant.binding ? this.access.verify(grant.binding) : undefined;
+    if (!permissions)
+      throw new InvalidTokenError(
+        'The access token that authorized this client is no longer active',
+      );
     return {
       token: accessToken,
       clientId: grant.clientId,
       scopes: grant.scopes,
       expiresAt: Math.floor(grant.accessExpiresAt / 1000),
       resource: new URL(grant.resource),
+      extra: {
+        callerId: `oauth:${grant.id}`,
+        tokenId: grant.binding!.tokenId,
+        tokenName: grant.binding!.name,
+        permissions,
+      },
     };
   }
 

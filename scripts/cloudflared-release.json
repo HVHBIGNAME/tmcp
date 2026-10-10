@@ -1,0 +1,30 @@
+{
+  "tag_name": "2026.9.3",
+  "assets": [
+    {
+      "name": "cloudflared-windows-amd64.exe",
+      "browser_download_url": "https://github.com/cloudflare/cloudflared/releases/download/2026.9.3/cloudflared-windows-amd64.exe",
+      "digest": "sha256:f096265ec2fcbe9bb6e2d64268db167ced3fcbb83d894bdb9e2fcdb26f2ea7e2"
+    },
+    {
+      "name": "cloudflared-linux-amd64",
+      "browser_download_url": "https://github.com/cloudflare/cloudflared/releases/download/2026.9.3/cloudflared-linux-amd64",
+      "digest": "sha256:77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2"
+    },
+    {
+      "name": "cloudflared-linux-arm64",
+      "browser_download_url": "https://github.com/cloudflare/cloudflared/releases/download/2026.9.3/cloudflared-linux-arm64",
+      "digest": "sha256:aaeb2d7d0da3614634c7e03ab13487a1522c2e79165ed2929cfe23d5e95b326d"
+    },
+    {
+      "name": "cloudflared-darwin-amd64.tgz",
+      "browser_download_url": "https://github.com/cloudflare/cloudflared/releases/download/2026.9.3/cloudflared-darwin-amd64.tgz",
+      "digest": "sha256:d1155d0837487f261183b15c1eab6c4ebcad9dc49b94675f1524c3564cea3977"
+    },
+    {
+      "name": "cloudflared-darwin-arm64.tgz",
+      "browser_download_url": "https://github.com/cloudflare/cloudflared/releases/download/2026.9.3/cloudflared-darwin-arm64.tgz",
+      "digest": "sha256:587c2cfb1c230fe36c7fa7727da78be459dae028cabe8c001291999350f07095"
+    }
+  ]
+}

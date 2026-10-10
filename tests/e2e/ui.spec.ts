@@ -2,9 +2,10 @@ import { test as base, expect } from '@playwright/test';
 import { createUiFixture } from '../ui-fixture.js';
 
 const test = base.extend<{ server: Awaited<ReturnType<typeof createUiFixture>> }>({
-  server: async ({}, use) => {
+  server: async ({ page }, use) => {
     const server = await createUiFixture();
     try {
+      await server.attach(page);
       await use(server);
     } finally {
       await server.close();
@@ -40,6 +41,34 @@ test('external address updates automatically, including when log auto-refresh is
   );
 });
 
+test('registration is not a reachability check and failed checks survive polling', async ({
+  page,
+  server,
+}) => {
+  server.connect();
+  await page.goto(server.url);
+  await expect(page.locator('.hero-title')).toHaveText('Туннель зарегистрирован');
+  await page.route('**/_control/api/connection/check', (route) =>
+    route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({ ok: false, message: 'Внешний адрес вернул HTTP 502.' }),
+    }),
+  );
+  await page.getByRole('button', { name: 'Проверить доступность' }).click();
+  await page.getByRole('button', { name: 'Обновить состояние' }).click();
+  await expect(page.locator('.hero-title')).toHaveText('Внешний адрес не отвечает');
+  await expect(page.locator('.check-result')).toContainText('HTTP 502');
+  await page.locator('nav [data-view="tokens"]').click();
+  await page.locator('nav [data-view="overview"]').click();
+  await expect(page.locator('.hero-title')).toHaveText('Туннель зарегистрирован');
+  server.connect('https://replacement.example.com');
+  await page.getByRole('button', { name: 'Обновить состояние' }).click();
+  await expect(page.getByLabel('Внешний адрес MCP')).toHaveValue(
+    'https://replacement.example.com/mcp',
+  );
+  await expect(page.locator('.check-result')).toBeHidden();
+});
+
 test('drafts and focus survive polling; unsaved changes use the custom dialog', async ({
   page,
   server,
@@ -71,12 +100,14 @@ test('token creation, permissions, rotation and deletion work with custom dialog
   await page.getByRole('button', { name: 'Новый токен' }).click();
   await page.getByRole('button', { name: 'Создать токен', exact: true }).click();
   await expect(page.getByRole('dialog').getByRole('alert')).toContainText('Введите имя');
+  await expect(page.getByLabel('Имя интеграции')).toBeFocused();
   await page.getByLabel('Имя интеграции').fill('Notion test');
   await page.getByRole('button', { name: 'Создать токен', exact: true }).click();
   const issued = page.getByRole('textbox', { name: 'Новый токен', exact: true });
   await expect(issued).toBeVisible();
   const oldKey = await issued.inputValue();
   expect(server.service.tokens.find(oldKey)).toBeTruthy();
+  expect(server.service.tokens.find(oldKey)?.permissions).toEqual(['files:read']);
   await page.getByRole('button', { name: 'Готово', exact: true }).click();
   await page.getByRole('button', { name: 'Разрешения', exact: true }).click();
   await page
@@ -98,7 +129,7 @@ test('token creation, permissions, rotation and deletion work with custom dialog
   await expect.poll(() => server.service.tokens.list()).toHaveLength(0);
 });
 
-test('authentication and connection recover without reloading or showing raw HTML errors', async ({
+test('IPC connection recovers without reloading or showing raw HTML errors', async ({
   page,
   server,
 }) => {
@@ -107,18 +138,18 @@ test('authentication and connection recover without reloading or showing raw HTM
   await page.route('**/_control/api/state', (route) =>
     failures-- > 0
       ? route.fulfill({
-          status: 401,
+          status: 503,
           contentType: 'application/json',
-          body: '{"error":"unauthorized"}',
+          body: '{"error":"starting"}',
         })
-      : route.continue(),
+      : route.fallback(),
   );
   await page.goto(server.url);
   await expect(page.getByLabel('Внешний адрес MCP')).toHaveValue(/https:/);
   await page.unroute('**/_control/api/state');
   let offline = true;
   await page.route('**/_control/api/state', (route) =>
-    offline ? route.abort() : route.continue(),
+    offline ? route.abort() : route.fallback(),
   );
   await page.getByRole('button', { name: 'Обновить состояние' }).click();
   await expect(page.getByText('Восстанавливаем связь с сервером')).toBeVisible();
@@ -137,6 +168,63 @@ test('authentication and connection recover without reloading or showing raw HTM
   await page.getByRole('button', { name: 'Обновить список' }).click();
   await expect(page.getByRole('alert')).toContainText('Сервер не смог');
   await expect(page.locator('body')).not.toContainText('SECRET STACK TRACE');
+});
+
+test('permission fields freeze during save and recover without losing the selection', async ({
+  page,
+  server,
+}) => {
+  const issued = await server.service.tokens.create({
+    name: 'Проверка сохранения',
+    permissions: ['files:read'],
+  });
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await page.route(`**/_control/api/tokens/${issued.id}`, async (route) => {
+    await pending;
+    await route.fulfill({
+      status: 503,
+      contentType: 'application/json',
+      body: JSON.stringify({ error: 'unavailable', message: 'Тестовый отказ сохранения' }),
+    });
+  });
+  await page.goto(server.url);
+  await page.locator('nav [data-view="tokens"]').click();
+  await page.getByRole('button', { name: 'Разрешения', exact: true }).click();
+  const dialog = page.getByRole('dialog');
+  try {
+    await dialog.getByRole('button', { name: 'Сохранить доступ' }).click();
+    for (const checkbox of await dialog.getByRole('checkbox').all())
+      await expect(checkbox).toBeDisabled();
+    await page.keyboard.press('Escape');
+    await expect(dialog).toBeVisible();
+  } finally {
+    release();
+  }
+  await expect(dialog.getByRole('alert')).toContainText('отказ сохранения');
+  for (const checkbox of await dialog.getByRole('checkbox').all())
+    await expect(checkbox).toBeEnabled();
+  await expect(dialog.getByRole('checkbox', { name: /Чтение файлов/ })).toBeChecked();
+  expect(server.service.tokens.list()[0]?.permissions).toEqual(['files:read']);
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('button', { name: 'Разрешения', exact: true })).toBeFocused();
+});
+
+test('integration names are rendered as text in cards and permission dialogs', async ({
+  page,
+  server,
+}) => {
+  const name = '<img src=x onerror=alert(1)>';
+  await server.service.tokens.create({ name, permissions: ['files:read'] });
+  await page.goto(server.url);
+  await page.locator('nav [data-view="tokens"]').click();
+  await expect(page.getByRole('heading', { name, exact: true })).toBeVisible();
+  await expect(page.locator('img[src="x"]')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Разрешения', exact: true }).click();
+  await expect(page.getByRole('dialog')).toContainText(name);
+  await expect(page.locator('img[src="x"]')).toHaveCount(0);
 });
 
 test('settings apply explicitly, preserve secrets, theme and autostart controls work', async ({

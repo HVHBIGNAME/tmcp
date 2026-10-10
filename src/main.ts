@@ -8,21 +8,18 @@ import { createApp } from './http.js';
 import { acquireLock, type RuntimeInfo } from './runtime.js';
 import { TunnelManager } from './tunnel-manager.js';
 import { atomicWrite, errorMessage, SerialQueue } from './utils.js';
-import { generateSecret, rotateEnvToken } from './secrets.js';
+import { listenControl } from './ipc.js';
+import { version } from './version.js';
 import type { Logger } from './tools.js';
 
 const { values } = parseArgs({
   options: {
     tunnel: { type: 'string' },
-    // Internal: the desktop shell starts the server and reads the admin token back.
-    ui: { type: 'boolean' },
   },
 });
 if (values.tunnel && !['quick', 'named'].includes(values.tunnel))
   throw new Error('--tunnel must be quick or named');
 const config = loadConfig();
-const uiPort = config.controlPort;
-if (uiPort === config.port) throw new Error('MCP_CONTROL_PORT must differ from MCP_PORT');
 const mode = values.tunnel === 'quick' ? 'quick' : values.tunnel === 'named' ? 'named' : 'local';
 await mkdir(config.dataDir, { recursive: true, mode: 0o700 });
 const unlock = await acquireLock(config.dataDir);
@@ -30,6 +27,8 @@ const log: Logger = (event) =>
   console.log(JSON.stringify({ time: new Date().toISOString(), ...event }));
 const runtime: RuntimeInfo = {
   service: 'pc-mcp-tunnel',
+  version,
+  codeDir: config.projectDir,
   instanceId: randomUUID(),
   pid: process.pid,
   startedAt: new Date().toISOString(),
@@ -58,19 +57,7 @@ server.headersTimeout = 15000;
 server.requestTimeout = 30000;
 server.keepAliveTimeout = 5000;
 
-/**
- * Separate listener for the desktop shell.
- *
- * The control API can rotate credentials and stop the server, so it never shares the port
- * that the tunnel exposes. This listener binds to loopback only.
- */
-const controlServer = createServer((req, res) => {
-  if (service) service.controlApp(req, res);
-  else {
-    res.writeHead(503, { 'Retry-After': '1' });
-    res.end('Starting');
-  }
-});
+let controlServer: Awaited<ReturnType<typeof listenControl>> | undefined;
 
 function stop(code: number): Promise<void> {
   if (stopping) return stopping;
@@ -80,16 +67,15 @@ function stop(code: number): Promise<void> {
     const force = setTimeout(() => process.exit(code || 1), 15000);
     force.unref();
     const closed = new Promise<void>((resolve) => server.close(() => resolve()));
-    const disconnect = setTimeout(() => server.closeAllConnections(), 3000);
+    const disconnect = setTimeout(() => {
+      server.closeAllConnections();
+    }, 2000);
     disconnect.unref();
-    const controlClosed = controlServer
-      ? new Promise<void>((resolve) => controlServer.close(() => resolve()))
-      : Promise.resolve();
     const results = await Promise.allSettled([
       service?.close(),
       tunnels?.stop(),
       closed,
-      controlClosed,
+      controlServer?.close(),
       persistRuntime(),
     ]);
     clearTimeout(disconnect);
@@ -128,17 +114,6 @@ try {
     shutdown: () => {
       void stop(0);
     },
-    rotateToken: async (kind, current) => {
-      // Rotating writes the new secret to .env; it takes effect on the next start.
-      const generated = generateSecret();
-      await rotateEnvToken(
-        path.join(config.projectDir, '.env'),
-        kind === 'owner' ? { ownerToken: generated } : { adminToken: generated },
-      );
-      log({ event: 'token_rotated', kind, note: 'Restart the app to apply' });
-      void current;
-      return generated;
-    },
     restartTunnel: async (target) => {
       if (!tunnels) throw new Error('A tunnel restart is already running');
       const replaced = await tunnels.restart(target);
@@ -167,14 +142,10 @@ try {
     await service.close();
     startup.signal.throwIfAborted();
   }
-  if (controlServer) {
-    await new Promise<void>((resolve, reject) => {
-      controlServer.once('error', reject);
-      controlServer.listen(uiPort, '127.0.0.1', () => {
-        controlServer.removeListener('error', reject);
-        resolve();
-      });
-    });
+  controlServer = await listenControl(config.dataDir, service.controlApp);
+  if (startup.signal.aborted) {
+    await controlServer.close();
+    startup.signal.throwIfAborted();
   }
   if (config.gatewayMode === 'namespaced') await service.gateway.warmup();
   startup.signal.throwIfAborted();
@@ -196,7 +167,9 @@ try {
     await persistRuntime();
   }
   log({ event: 'listener_ready', localUrl: config.localUrl });
-  console.log(`Credentials: ${path.join(config.projectDir, '.env')} (MCP_TOKEN / MCP_ADMIN_TOKEN)`);
+  console.log(
+    'Client access: issue a key in Access or with tmcp token create. Local control uses OS-protected IPC.',
+  );
   if (mode !== 'local' && mode === 'quick')
     console.log(
       'Quick Tunnel: the URL changes when the tunnel is recreated. Reconnect Notion after reading this line.',

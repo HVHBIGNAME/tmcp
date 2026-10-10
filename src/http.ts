@@ -1,5 +1,5 @@
 import express, { type ErrorRequestHandler, type RequestHandler } from 'express';
-import { rateLimit } from 'express-rate-limit';
+import { ipKeyGenerator, rateLimit, type Options } from 'express-rate-limit';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { InvalidTokenError, OAuthError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
@@ -8,8 +8,8 @@ import { AuthStore } from './auth/store.js';
 import { validatePublicUrl, type Config } from './config.js';
 import { Files } from './files.js';
 import { Processes } from './processes.js';
-import { createMcpServer, type Logger } from './tools.js';
-import { errorMessage, secretEqual, SerialQueue } from './utils.js';
+import { createMcpServer, type Caller, type Logger } from './tools.js';
+import { errorMessage, hash, SerialQueue } from './utils.js';
 import { Workspace } from './workspace.js';
 import { Gateway } from './gateway/gateway.js';
 import { Approvals, AuditLog } from './approvals.js';
@@ -18,39 +18,79 @@ import { defaultSettings, SettingsStore, settingsPath } from './settings.js';
 import { controlErrorHandler, controlRouter } from './control.js';
 import { Telegram } from './telegram.js';
 import { appendFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { consentErrorPage } from './auth/consent.js';
 import path from 'node:path';
-import type { OwnerSecrets } from './secrets.js';
-import { allPermissions } from './permissions.js';
-import type { Caller } from './tools.js';
+import { parsePermissions } from './permissions.js';
 import { z } from 'zod';
 import { connectionView } from './connection.js';
-import { Autostart, type AutostartControl } from './autostart.js';
+import { autostartFor, type AutostartControl } from './autostart.js';
+import { Traffic, type TrafficSpan } from './traffic.js';
+import { controlPrivatePaths } from './ipc.js';
 
 export interface HttpOptions {
   log?: Logger;
   status?: () => Record<string, unknown>;
   shutdown?: () => void;
   deferGatewayWarmup?: boolean;
-  rotateToken?: (kind: 'owner' | 'admin', current: string) => Promise<string>;
   restartTunnel?: (mode: 'quick' | 'named') => Promise<{ url: string }>;
   restartServer?: () => void;
-  /** Directory with the control UI assets. */
-  uiDir?: string;
   startedAt?: string;
   telegramApiBase?: string;
   autostart?: AutostartControl;
 }
 
+/**
+ * Rate-limit key that survives the tunnel.
+ *
+ * CF-Connecting-IP is set by the Cloudflare edge and cannot be forged by the caller,
+ * while X-Forwarded-For is appended to by the tunnel: its first entry is chosen by the
+ * client, so keying on it would let anyone reset their own counter with every request.
+ * IPv6 addresses collapse to their /64 subnet, so one client cannot rotate through a
+ * prefix to get a fresh budget.
+ */
+const clientKey: Options['keyGenerator'] = (req) => {
+  const header = req.headers['cf-connecting-ip'];
+  const value = Array.isArray(header) ? header[0] : header;
+  const address =
+    typeof value === 'string' && /^[0-9a-fA-F:.]{3,45}$/.test(value) ? value : (req.ip ?? '');
+  return ipKeyGenerator(address, 64) || 'local';
+};
+
 export async function createApp(config: Config, options: HttpOptions = {}) {
   const log =
     options.log ??
     ((event) => console.log(JSON.stringify({ time: new Date().toISOString(), ...event })));
-  const workspace = await Workspace.open(config.roots);
+  const workspace = await Workspace.open(config.roots, [
+    path.join(config.projectDir, '.env'),
+    config.envFile,
+    config.dataDir,
+    ...(config.desktopExecutable ? [path.dirname(config.envFile), config.desktopExecutable] : []),
+    ...(await controlPrivatePaths(config.dataDir)),
+  ]);
   const files = new Files(workspace, config.maxFileBytes);
   const processes = new Processes(workspace, config);
-  const store = await AuthStore.open(config.dataDir, config.adminToken);
-  const auth = new AuthProvider(config, store);
+  const store = await AuthStore.open(config.dataDir);
   const tokens = await TokenStore.open(config.dataDir);
+  const traffic = new Traffic();
+  const auth = new AuthProvider(
+    config,
+    store,
+    {
+      resolve: (presented) => {
+        const found = tokens.find(presented);
+        if (found)
+          return {
+            tokenId: found.id,
+            tokenHash: hash(presented),
+            name: tokens.list().find((record) => record.id === found.id)?.name ?? found.id,
+          };
+        return undefined;
+      },
+      verify: (binding) => tokens.activeById(binding.tokenId, binding.tokenHash),
+    },
+    log,
+  );
   const settings = new SettingsStore(settingsPath(config.dataDir), {
     ...structuredClone(defaultSettings),
     gateway: { discover: config.gatewayDiscover, mode: config.gatewayMode },
@@ -71,7 +111,6 @@ export async function createApp(config: Config, options: HttpOptions = {}) {
   );
   let telegram: Telegram | undefined;
   let telegramSignature = '';
-  const uiDir = options.uiDir ?? path.join(config.projectDir, 'ui', 'public');
   const startedAt = options.startedAt ?? new Date().toISOString();
 
   /** Remote control through the bot; every command maps to the same services as the GUI. */
@@ -218,21 +257,48 @@ export async function createApp(config: Config, options: HttpOptions = {}) {
   app.disable('x-powered-by');
   app.set('trust proxy', 'loopback');
   const localHosts = new Set([`127.0.0.1:${config.port}`, `localhost:${config.port}`]);
+  const hostname = (value: string) =>
+    value
+      .trim()
+      .replace(/^https?:\/\//i, '')
+      .replace(/\/.*$/, '')
+      .toLowerCase();
+
+  /**
+   * The paths a browser-based MCP client needs: dynamic registration, the authorization
+   * handshake and the resource itself. Authorization is a Bearer token here, never a
+   * cookie, so another site cannot borrow the visitor's credentials to call these routes.
+   * Control routes are available only over OS-protected IPC.
+   */
+  const browserSurface = (path: string) =>
+    path === '/mcp' ||
+    path === '/health' ||
+    path === '/register' ||
+    path === '/revoke' ||
+    path === '/oauth/approve' ||
+    path.startsWith('/authorize') ||
+    path.startsWith('/token') ||
+    path.startsWith('/.well-known/');
 
   app.use((req, res, next) => {
     const host = req.headers.host?.toLowerCase();
-    if (!host || (!localHosts.has(host) && host !== new URL(config.publicUrl).host)) {
+    const known = new Set([...localHosts, new URL(config.publicUrl).host]);
+    const configured = hostname(settings.get().tunnel.hostname);
+    if (configured) known.add(configured);
+    if (!host || !known.has(host)) {
       res.status(403).json({ error: 'Unrecognized Host' });
       return;
     }
     const origin = req.headers.origin;
-    const origins = new Set([
-      config.publicUrl,
-      config.localUrl,
-      `http://localhost:${config.port}`,
-      ...config.allowedOrigins,
-    ]);
-    if (origin && !origins.has(origin)) {
+    const listed =
+      origin !== undefined &&
+      [
+        config.publicUrl,
+        config.localUrl,
+        `http://localhost:${config.port}`,
+        ...config.allowedOrigins,
+      ].includes(origin);
+    if (origin && !listed && !browserSurface(req.path) && hostname(origin) !== host) {
       res.status(403).json({ error: 'Unrecognized Origin' });
       return;
     }
@@ -243,7 +309,7 @@ export async function createApp(config: Config, options: HttpOptions = {}) {
       'Referrer-Policy': 'no-referrer',
       'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
     });
-    if (origin) {
+    if (origin && (listed || browserSurface(req.path))) {
       res.set('Access-Control-Allow-Origin', origin);
       res.vary('Origin');
       res.set('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
@@ -263,23 +329,40 @@ export async function createApp(config: Config, options: HttpOptions = {}) {
   /**
    * Resolves the caller and what it may do.
    *
-   * Shared tokens are checked first, because they carry a narrower permission set than
-   * the owner's static token and than an OAuth grant. The owner token and OAuth grants
-   * always receive the full permission set.
+   * Issued keys and OAuth grants share the same live permission check. Revoking the
+   * key that authorized a grant also revokes that client's access.
    */
   const resolveCaller = async (presented: string): Promise<Caller> => {
     const shared = tokens.find(presented);
     if (shared) {
-      await tokens.touch(shared.id);
+      void tokens
+        .touch(shared.id)
+        .catch((error: unknown) =>
+          log({ event: 'token_usage_write_error', message: errorMessage(error) }),
+        );
       const record = tokens.list().find((candidate) => candidate.id === shared.id);
       return {
         id: shared.id,
+        tokenId: shared.id,
         permissions: shared.permissions,
         tokenName: record?.name ?? shared.id,
       };
     }
     const info = await auth.verifyAccessToken(presented);
-    return { id: info.clientId, permissions: [...allPermissions] };
+    const granted = info.extra?.permissions;
+    const tokenId = typeof info.extra?.tokenId === 'string' ? info.extra.tokenId : undefined;
+    if (tokenId)
+      void tokens
+        .touch(tokenId)
+        .catch((error: unknown) =>
+          log({ event: 'token_usage_write_error', message: errorMessage(error) }),
+        );
+    return {
+      id: typeof info.extra?.callerId === 'string' ? info.extra.callerId : info.clientId,
+      tokenId,
+      permissions: Array.isArray(granted) ? parsePermissions(granted) : [],
+      tokenName: typeof info.extra?.tokenName === 'string' ? info.extra.tokenName : info.clientId,
+    };
   };
 
   const authenticate: RequestHandler = async (req, res, next) => {
@@ -294,6 +377,7 @@ export async function createApp(config: Config, options: HttpOptions = {}) {
         expiresAt: Math.floor(Date.now() / 1000) + 3600,
       };
       res.locals.caller = caller;
+      (res.locals.traffic as TrafficSpan | undefined)?.authorized(caller);
       next();
     } catch (error) {
       if (!(error instanceof InvalidTokenError)) {
@@ -315,46 +399,23 @@ export async function createApp(config: Config, options: HttpOptions = {}) {
     res
       .type('text')
       .send(
-        'PC MCP Tunnel is running. MCP endpoint: /mcp. Authentication: OAuth or Authorization: Bearer <MCP_TOKEN>.',
+        'PC MCP Tunnel is running. MCP endpoint: /mcp. Use a key issued in Access, directly as a Bearer token or to authorize OAuth.',
       );
   });
 
-  const admin: RequestHandler = (req, res, next) => {
-    const match = /^Bearer ([A-Za-z0-9_-]{1,512})$/i.exec(req.headers.authorization ?? '');
-    if (!match?.[1] || !secretEqual(match[1], config.adminToken)) {
-      res.status(401).json({ error: 'unauthorized' });
-      return;
-    }
-    next();
-  };
-  app.get('/_control/status', admin, (_req, res) => {
-    res.json(options.status?.() ?? { service: 'pc-mcp-tunnel', publicUrl: config.publicUrl });
-  });
-  const owner: OwnerSecrets = {
-    bearerToken: config.bearerToken,
-    adminToken: config.adminToken,
-    envFile: path.join(config.projectDir, '.env'),
-  };
-
-  /**
-   * Control plane for the desktop app, on its own loopback listener.
-   *
-   * Kept off the public listener entirely: the tunnel can never reach this port, and a
-   * leaked admin secret cannot be used from outside the machine.
-   */
+  /** TCP connections are rejected even if an embedder mounts this app on a port. */
   const controlApp = express();
   controlApp.disable('x-powered-by');
   controlApp.use((req, res, next) => {
-    const host = req.headers.host ?? '';
-    const origin = req.headers.origin;
     if (
-      !/^(127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/.test(host) ||
-      (origin && origin !== `http://${host}`) ||
-      req.headers['sec-fetch-site'] === 'cross-site'
+      req.socket.remoteAddress !== undefined ||
+      req.headers.host !== 'tmcp.local' ||
+      req.headers.origin !== undefined ||
+      req.headers['sec-fetch-site'] !== undefined
     ) {
       res.status(403).json({
         error: 'invalid_origin',
-        message: 'Доступ разрешён только из локального приложения.',
+        message: 'Управление доступно только через локальный IPC.',
       });
       return;
     }
@@ -362,7 +423,18 @@ export async function createApp(config: Config, options: HttpOptions = {}) {
     next();
   });
   controlApp.get('/_control/bootstrap', (_req, res) => {
-    res.json({ service: 'pc-mcp-tunnel', adminToken: config.adminToken });
+    res.json({ service: 'pc-mcp-tunnel' });
+  });
+  controlApp.get('/_control/status', (_req, res) => {
+    res.json(options.status?.() ?? { service: 'pc-mcp-tunnel', publicUrl: config.publicUrl });
+  });
+  controlApp.post('/_control/shutdown', (_req, res) => {
+    if (!options.shutdown) {
+      res.status(409).json({ error: 'Shutdown is unavailable in embedded mode' });
+      return;
+    }
+    res.json({ stopping: true });
+    setImmediate(options.shutdown);
   });
   controlApp.use('/_control/api', express.json({ limit: '256kb' }));
   controlApp.use(
@@ -371,64 +443,62 @@ export async function createApp(config: Config, options: HttpOptions = {}) {
       tokens,
       approvals,
       audit,
+      traffic,
       settings,
       gateway,
       processes,
       telegram: () => telegram,
       applySettings,
-      owner,
       publicUrl: () => config.publicUrl,
       connection: () => connectionView(config, options.status?.()),
       capabilities: { shell: config.shellEnabled, screenshots: config.screenshotsEnabled },
       startedAt,
       log,
-      autostart: options.autostart ?? new Autostart(config.projectDir, config.dataDir),
-      rotateToken:
-        options.rotateToken ??
-        (async (kind) => (kind === 'owner' ? config.bearerToken : config.adminToken)),
+      autostart: options.autostart ?? autostartFor(config),
       restartTunnel: options.restartTunnel ?? (async () => ({ url: config.publicUrl })),
       restartServer: options.restartServer ?? (() => undefined),
     }),
-  );
-  controlApp.use('/ui', (_req, res, next) => {
-    res.set(
-      'Content-Security-Policy',
-      "default-src 'none'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'",
-    );
-    next();
-  });
-  controlApp.use(
-    '/ui',
-    express.static(uiDir, { index: 'index.html', dotfiles: 'deny', maxAge: 0 }),
   );
   controlApp.use((_req, res) => {
     res.status(404).json({ error: 'not_found' });
   });
   controlApp.use(controlErrorHandler(log));
 
-  app.post('/_control/shutdown', admin, (_req, res) => {
-    if (!options.shutdown) {
-      res.status(409).json({ error: 'Shutdown is unavailable in embedded mode' });
-      return;
-    }
-    res.json({ stopping: true });
-    setImmediate(options.shutdown);
-  });
-
-  app.post(
-    '/oauth/approve',
+  const limiter = (limit: number, windowMs: number) =>
     rateLimit({
-      windowMs: 15 * 60 * 1000,
-      limit: 10,
+      windowMs,
+      limit,
+      keyGenerator: clientKey,
       standardHeaders: 'draft-8',
       legacyHeaders: false,
-    }),
+    });
+  app.use(['/authorize', '/token', '/revoke', '/oauth/approve'], (req, res, next) => {
+    const route = req.baseUrl;
+    res.once('finish', () =>
+      log({
+        event: 'oauth_request',
+        path: route,
+        method: req.method,
+        status: res.statusCode,
+      }),
+    );
+    next();
+  });
+  // The SDK rate limits its own handlers on request.ip, which the tunnel makes
+  // client-controlled through X-Forwarded-For. These run first, keyed on an address the
+  // caller cannot forge, so the authorization endpoints stay bounded from the internet.
+  app.use(['/token', '/authorize', '/revoke'], limiter(60, 15 * 60 * 1000));
+  app.post(
+    '/oauth/approve',
+    limiter(10, 15 * 60 * 1000),
     express.urlencoded({ extended: false, limit: '8kb' }),
-    (req, res) => {
-      auth.approve(req, res);
+    async (req, res) => {
+      await auth.approve(req, res);
     },
   );
-  app.use('/register', express.json({ limit: '32kb' }));
+  // Registration is public by design, so it is bounded: a client is only ever registered
+  // once per integration.
+  app.use('/register', limiter(20, 15 * 60 * 1000), express.json({ limit: '32kb' }));
   const makeRouter = () =>
     mcpAuthRouter({
       provider: auth,
@@ -449,24 +519,38 @@ export async function createApp(config: Config, options: HttpOptions = {}) {
     });
   });
   app.use((req, res, next) => authRouter(req, res, next));
-
   app.use(
     '/mcp',
-    rateLimit({ windowMs: 60000, limit: 300, standardHeaders: 'draft-8', legacyHeaders: false }),
+    (req, res, next) => {
+      const span = traffic.begin(req.method);
+      res.locals.traffic = span;
+      res.once('finish', () => span.finish(res.statusCode, true));
+      res.once('close', () => span.finish(res.statusCode, res.writableFinished));
+      next();
+    },
+    limiter(300, 60000),
     authenticate,
   );
   app.post(
     '/mcp',
     express.json({ limit: config.maxFileBytes * 2 + 65536 }),
     async (req, res, next) => {
+      const span = res.locals.traffic as TrafficSpan;
+      span.describe(req.body?.method, req.body?.params?.name);
       const server = createMcpServer(
-        { config, files, processes, log, gateway, approvals, audit, settings },
+        { config, files, processes, log, gateway, approvals, audit, settings, traffic: span },
         res.locals.caller as Caller,
       );
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
         enableJsonResponse: true,
       });
+      const send = transport.send.bind(transport);
+      transport.send = (message, options) => {
+        if ('error' in message) span.result(true);
+        if ('result' in message && message.result.isError === true) span.result(true);
+        return send(message, options);
+      };
       res.once('close', () => {
         void server
           .close()
@@ -498,12 +582,40 @@ export async function createApp(config: Config, options: HttpOptions = {}) {
   app.use((_req, res) => {
     res.status(404).json({ error: 'not_found' });
   });
-  const errorHandler: ErrorRequestHandler = (error: unknown, _req, res, next) => {
+  const errorHandler: ErrorRequestHandler = (error: unknown, req, res, next) => {
     if (res.headersSent) {
       next(error);
       return;
     }
     if (error instanceof OAuthError) {
+      log({
+        event: 'oauth_request_rejected',
+        path: req.path,
+        client_id:
+          typeof req.query.client_id === 'string' ? req.query.client_id.slice(0, 8) : undefined,
+        reason: error.errorCode,
+        message: error.message,
+      });
+      // The authorization page is shown to a person in a browser window, so a rejection
+      // has to read as a page. A machine-facing endpoint keeps the JSON body.
+      if (req.path.startsWith('/authorize')) {
+        const nonce = randomUUID().replaceAll('-', '');
+        res
+          .status(400)
+          .set(
+            'Content-Security-Policy',
+            `default-src 'none'; style-src 'nonce-${nonce}'; frame-ancestors 'none'; base-uri 'none'`,
+          )
+          .type('html')
+          .send(
+            consentErrorPage(
+              'Подключение не удалось начать',
+              'Приложение отправило запрос, который этот сервер не принимает. Обновите приложение или подключите сервер напрямую по адресу и токену, без OAuth.',
+              nonce,
+            ),
+          );
+        return;
+      }
       res.status(400).json(error.toResponseObject());
       return;
     }
@@ -520,6 +632,7 @@ export async function createApp(config: Config, options: HttpOptions = {}) {
   };
   app.use(errorHandler);
 
+  let closing: Promise<void> | undefined;
   return {
     app,
     controlApp,
@@ -531,6 +644,7 @@ export async function createApp(config: Config, options: HttpOptions = {}) {
     tokens,
     settings,
     audit,
+    traffic,
     get telegram() {
       return telegram;
     },
@@ -538,17 +652,24 @@ export async function createApp(config: Config, options: HttpOptions = {}) {
       config.publicUrl = validatePublicUrl(url);
       authRouter = makeRouter();
     },
-    close: async () => {
-      approvals.cancelAll('The server stopped');
-      unsubscribeApprovals();
-      await telegram?.stop();
-      const results = await Promise.allSettled([processes.shutdown(), gateway.close()]);
-      const errors = results.filter((result) => result.status === 'rejected');
-      if (errors.length)
-        throw new AggregateError(
-          errors.map((result) => result.reason),
-          'Service shutdown failed',
-        );
-    },
+    close: () =>
+      (closing ??= (async () => {
+        traffic.close();
+        approvals.cancelAll('The server stopped');
+        unsubscribeApprovals();
+        const results = await Promise.allSettled([
+          telegram?.stop(),
+          processes.shutdown(),
+          gateway.close(),
+          audit.flush(),
+          tokens.flushUsage(),
+        ]);
+        const errors = results.filter((result) => result.status === 'rejected');
+        if (errors.length)
+          throw new AggregateError(
+            errors.map((result) => result.reason),
+            'Service shutdown failed',
+          );
+      })()),
   };
 }

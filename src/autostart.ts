@@ -3,7 +3,9 @@ import { access, mkdir, readFile, rm } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import os from 'node:os';
 import path from 'node:path';
-import { atomicWrite, isErrno } from './utils.js';
+import { atomicWrite, hash, isErrno, SerialQueue } from './utils.js';
+import type { Config } from './config.js';
+import { installDesktop, windowsArgument } from './desktop-install.js';
 
 const exec = promisify(execFile);
 const registryKey = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
@@ -13,6 +15,8 @@ export interface AutostartStatus {
   enabled: boolean;
   kind: string;
   detail: string;
+  executable?: string;
+  registrationName?: string;
 }
 
 export interface AutostartControl {
@@ -20,13 +24,14 @@ export interface AutostartControl {
   set(enabled: boolean): Promise<AutostartStatus>;
 }
 
-const xml = (value: string) =>
-  value
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&apos;');
+const xmlEntities: Record<string, string> = {
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&apos;',
+};
+const xml = (value: string) => value.replace(/[&<>"']/g, (character) => xmlEntities[character]!);
 const systemdArg = (value: string) =>
   `"${value
     .replaceAll('\\', '\\\\')
@@ -75,10 +80,20 @@ export function startupDefinition(
 
 export class Autostart implements AutostartControl {
   private cached?: { at: number; value: AutostartStatus };
+  private readonly writes = new SerialQueue();
   constructor(
     private readonly project: string,
     private readonly dataDir: string,
+    private readonly desktop?: { executable: string; home: string; headless?: boolean },
   ) {}
+
+  private registrationName(): string {
+    const home = this.desktop?.home;
+    const standard = path.join(process.env.LOCALAPPDATA ?? os.homedir(), 'TMCP');
+    return home && path.resolve(home).toLowerCase() !== path.resolve(standard).toLowerCase()
+      ? `TMCP-${hash(path.resolve(home).toLowerCase()).slice(0, 12)}`
+      : 'TMCP';
+  }
 
   private file(): string {
     return process.platform === 'darwin'
@@ -92,11 +107,19 @@ export class Autostart implements AutostartControl {
     let enabled = false;
     if (process.platform === 'win32') {
       try {
-        const result = await exec('reg.exe', ['query', registryKey, '/v', 'TMCP'], {
-          windowsHide: true,
-          timeout: 5000,
-        });
-        enabled = /TMCP\s+REG_SZ/.test(result.stdout);
+        const result = await exec(
+          'reg.exe',
+          ['query', registryKey, '/v', this.registrationName()],
+          {
+            windowsHide: true,
+            timeout: 5000,
+          },
+        );
+        enabled = /REG_SZ/.test(result.stdout);
+        if (this.desktop)
+          enabled &&= result.stdout
+            .toLowerCase()
+            .includes(path.join(this.desktop.home, 'TMCP.exe').toLowerCase());
       } catch {
         enabled = false;
       }
@@ -133,19 +156,54 @@ export class Autostart implements AutostartControl {
             ? 'launchd'
             : 'systemd --user',
       detail: supported
-        ? 'Запуск при входе пользователя. На Linux запуск до входа требует loginctl enable-linger.'
+        ? this.desktop
+          ? `При включении EXE устанавливается в ${this.desktop.home}. Запуск при входе пользователя.`
+          : 'Запуск при входе пользователя. На Linux запуск до входа требует loginctl enable-linger.'
         : 'Пользовательский менеджер автозапуска недоступен в этой среде.',
+      ...(this.desktop
+        ? {
+            executable: path.join(this.desktop.home, 'TMCP.exe'),
+            registrationName: this.registrationName(),
+          }
+        : {}),
     };
     this.cached = { at: Date.now(), value };
     return value;
   }
 
-  async set(enabled: boolean): Promise<AutostartStatus> {
+  set(enabled: boolean): Promise<AutostartStatus> {
+    return this.writes.run(() => this.apply(enabled));
+  }
+
+  private async apply(enabled: boolean): Promise<AutostartStatus> {
+    this.cached = undefined;
     const status = await this.status();
     if (!status.supported) throw new Error('Autostart is unavailable in this environment');
-    if (enabled === status.enabled) return status;
+    if (enabled === status.enabled && !(enabled && this.desktop)) return status;
     if (process.platform === 'win32') {
       if (enabled) {
+        if (this.desktop) {
+          const executable = await installDesktop(this.desktop.executable, this.desktop.home);
+          this.desktop.executable = executable;
+          const command = `${windowsArgument(executable)} --autostart${this.desktop.headless ? ' --headless' : ''} --home ${windowsArgument(this.desktop.home)}`;
+          await exec(
+            'reg.exe',
+            [
+              'add',
+              registryKey,
+              '/v',
+              this.registrationName(),
+              '/t',
+              'REG_SZ',
+              '/d',
+              command,
+              '/f',
+            ],
+            { windowsHide: true, timeout: 5000 },
+          );
+          this.cached = undefined;
+          return this.status();
+        }
         let gui = false;
         try {
           await access(path.join(this.project, 'dist-ui', 'PcMcp.exe'));
@@ -171,11 +229,11 @@ export class Autostart implements AutostartControl {
         }
         await exec(
           'reg.exe',
-          ['add', registryKey, '/v', 'TMCP', '/t', 'REG_SZ', '/d', command, '/f'],
+          ['add', registryKey, '/v', this.registrationName(), '/t', 'REG_SZ', '/d', command, '/f'],
           { windowsHide: true, timeout: 5000 },
         );
       } else
-        await exec('reg.exe', ['delete', registryKey, '/v', 'TMCP', '/f'], {
+        await exec('reg.exe', ['delete', registryKey, '/v', this.registrationName(), '/f'], {
           windowsHide: true,
           timeout: 5000,
         });
@@ -202,4 +260,18 @@ export class Autostart implements AutostartControl {
     this.cached = undefined;
     return this.status();
   }
+}
+
+export function autostartFor(config: Config): Autostart {
+  return new Autostart(
+    config.projectDir,
+    config.dataDir,
+    config.desktopExecutable
+      ? {
+          executable: config.desktopExecutable,
+          home: path.dirname(config.envFile),
+          headless: config.desktopMode === 'cli',
+        }
+      : undefined,
+  );
 }

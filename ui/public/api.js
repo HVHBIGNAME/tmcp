@@ -6,89 +6,84 @@ export class ApiError extends Error {
   }
 }
 
+function bridge() {
+  if (!window.chrome?.webview)
+    throw new ApiError(
+      'Откройте панель в приложении PC MCP. Управление доступно через локальный IPC.',
+    );
+  return window.chrome.webview;
+}
+
+function reply(message) {
+  const { status, data } = message;
+  if (!Number.isInteger(status) || status < 200 || status >= 300)
+    throw new ApiError(
+      data?.message ||
+        message.message ||
+        (status === 503
+          ? 'Сервер запускается. Подождите немного.'
+          : 'Сервер не смог выполнить действие. Повторите попытку.'),
+      status || 0,
+      data?.fields,
+    );
+  if (status === 204) return null;
+  if (data === null || typeof data !== 'object')
+    throw new ApiError('Сервер вернул неожиданный ответ. Повторите попытку.');
+  return data;
+}
+
+/** The desktop bridge sends HTTP-framed requests over OS-protected IPC. */
 export class ControlClient {
-  constructor(base = location.origin) {
-    this.base = base;
-    this.admin = '';
-    this.authorization = null;
+  constructor() {
     this.requests = new Set();
   }
 
-  async authorize() {
-    if (this.authorization) return this.authorization;
-    this.authorization = (async () => {
-      const response = await this.request('/_control/bootstrap', { method: 'GET' });
-      if (typeof response?.adminToken !== 'string' || !response.adminToken)
-        throw new ApiError('Не удалось открыть сессию управления. Повторяем подключение.');
-      this.admin = response.adminToken;
-    })().finally(() => {
-      this.authorization = null;
-    });
-    return this.authorization;
-  }
-
-  async request(path, { timeout = 12000, ...options } = {}) {
+  async call(path, { timeout = 15000, method = 'GET', body } = {}) {
+    const native = bridge();
+    const id = crypto.randomUUID();
     const abort = new AbortController();
     this.requests.add(abort);
-    const timer = setTimeout(() => abort.abort(), timeout);
-    try {
-      const response = await fetch(`${this.base}${path}`, {
-        ...options,
-        signal: abort.signal,
-        cache: 'no-store',
-      });
-      const json = (response.headers.get('content-type') ?? '').includes('application/json');
-      const data = json ? await response.json() : null;
-      if (!response.ok) {
-        throw new ApiError(
-          data?.message ||
-            (response.status === 401
-              ? 'Сессия истекла. Подключаемся заново.'
-              : response.status === 503
-                ? 'Сервер запускается. Подождите немного.'
-                : 'Сервер не смог выполнить действие. Повторите попытку.'),
-          response.status,
-          data?.fields,
-        );
-      }
-      if (response.status === 204) return null;
-      if (!json) throw new ApiError('Сервер вернул неожиданный ответ. Повторите попытку.');
-      return data;
-    } catch (error) {
-      if (error instanceof ApiError) throw error;
-      throw new ApiError(
-        abort.signal.aborted
-          ? 'Сервер не ответил вовремя. Проверьте соединение и повторите попытку.'
-          : 'Нет связи с сервером. Приложение подключится автоматически.',
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        native.removeEventListener('message', receive);
+        this.requests.delete(abort);
+      };
+      const receive = (event) => {
+        if (event.data?.type !== 'control-response' || event.data.id !== id) return;
+        cleanup();
+        try {
+          resolve(reply(event.data));
+        } catch (error) {
+          reject(error);
+        }
+      };
+      abort.signal.addEventListener(
+        'abort',
+        () => {
+          cleanup();
+          native.postMessage({ type: 'control-cancel', id });
+          reject(
+            new ApiError('Сервер не ответил вовремя. Проверьте соединение и повторите попытку.'),
+          );
+        },
+        { once: true },
       );
-    } finally {
-      clearTimeout(timer);
-      this.requests.delete(abort);
-    }
-  }
-
-  async call(path, options = {}) {
-    if (!this.admin) await this.authorize();
-    const run = () =>
-      this.request(`/_control/api${path}`, {
-        ...options,
-        headers: { Authorization: `Bearer ${this.admin}`, 'Content-Type': 'application/json' },
+      const timer = setTimeout(() => abort.abort(), timeout);
+      native.addEventListener('message', receive);
+      native.postMessage({
+        type: 'control-request',
+        id,
+        path: `/_control/api${path}`,
+        method,
+        body,
       });
-    try {
-      return await run();
-    } catch (error) {
-      if (error.status !== 401) throw error;
-      this.admin = '';
-      await this.authorize();
-      // Authentication middleware rejected the first request before any action ran.
-      return run();
-    }
+    });
   }
 
   dispose() {
     for (const abort of this.requests) abort.abort();
     this.requests.clear();
-    this.admin = '';
   }
 }
 
@@ -136,5 +131,78 @@ export class StatePoller {
     this.stopped = true;
     clearTimeout(this.timer);
     this.client.dispose();
+  }
+}
+
+export class ActivityStream {
+  constructor(client, onEvent, onConnection) {
+    Object.assign(this, { client, onEvent, onConnection, controller: null });
+  }
+
+  start() {
+    if (this.controller) return;
+    const controller = new AbortController();
+    this.controller = controller;
+    void this.run(controller).finally(() => {
+      if (this.controller === controller) this.controller = null;
+    });
+  }
+
+  stop() {
+    this.controller?.abort();
+    this.controller = null;
+  }
+
+  async run(controller) {
+    let retry = 500;
+    const { signal } = controller;
+    while (!signal.aborted) {
+      try {
+        await this.subscribe(signal, () => {
+          retry = 500;
+          this.onConnection(true);
+        });
+      } catch {
+        if (signal.aborted) return;
+      }
+      if (signal.aborted) return;
+      this.onConnection(false);
+      await new Promise((resolve) => {
+        const done = () => {
+          clearTimeout(timer);
+          signal.removeEventListener('abort', done);
+          resolve();
+        };
+        const timer = setTimeout(done, retry);
+        signal.addEventListener('abort', done, { once: true });
+      });
+      retry = Math.min(8000, retry * 2);
+    }
+  }
+
+  subscribe(signal, connected) {
+    const native = bridge();
+    const id = crypto.randomUUID();
+    return new Promise((resolve) => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        native.removeEventListener('message', receive);
+        signal.removeEventListener('abort', cleanup);
+        native.postMessage({ type: 'control-cancel', id });
+        resolve();
+      };
+      const receive = (event) => {
+        if (event.data?.id !== id) return;
+        if (event.data.type === 'control-stream-open') {
+          clearTimeout(timer);
+          connected();
+        } else if (event.data.type === 'control-event') this.onEvent(event.data.data);
+        else if (['control-stream-end', 'control-response'].includes(event.data.type)) cleanup();
+      };
+      const timer = setTimeout(cleanup, 5000);
+      native.addEventListener('message', receive);
+      signal.addEventListener('abort', cleanup, { once: true });
+      native.postMessage({ type: 'control-subscribe', id });
+    });
   }
 }

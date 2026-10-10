@@ -10,9 +10,7 @@ import { startupDefinition } from '../src/autostart.js';
 test('control state distinguishes local readiness from a usable external MCP URL', async (t) => {
   const ui = await createUiFixture();
   t.after(() => ui.close());
-  const base = ui.url.replace('/ui/', '');
-  const headers = { Authorization: `Bearer ${ui.config.adminToken}` };
-  const state = async () => (await fetch(`${base}/_control/api/state`, { headers })).json();
+  const state = async () => (await ui.control('/_control/api/state')).json();
   const starting = await state();
   assert.equal(starting.connection.mcpUrl, null);
   assert.equal(starting.connection.status, 'starting');
@@ -29,14 +27,8 @@ test('control state distinguishes local readiness from a usable external MCP URL
 test('invalid control requests return JSON without HTML, stack traces or input secrets', async (t) => {
   const ui = await createUiFixture();
   t.after(() => ui.close());
-  const base = ui.url.replace('/ui/', '');
-  const headers = {
-    Authorization: `Bearer ${ui.config.adminToken}`,
-    'Content-Type': 'application/json',
-  };
-  const response = await fetch(`${base}/_control/api/settings`, {
+  const response = await ui.control('/_control/api/settings', {
     method: 'PATCH',
-    headers,
     body: JSON.stringify({ telegram: { token: 'secret-value', allowedChats: ['not a number'] } }),
   });
   assert.equal(response.status, 400);
@@ -46,7 +38,7 @@ test('invalid control requests return JSON without HTML, stack traces or input s
   assert(!message.includes('<html'));
   assert(!message.includes('stack'));
   assert.equal(ui.service.settings.redacted().telegram.tokenSet, false);
-  const origin = await fetch(`${base}/_control/bootstrap`, {
+  const origin = await ui.control('/_control/bootstrap', {
     headers: { Origin: 'https://example.com' },
   });
   assert.equal(origin.status, 403);
@@ -58,6 +50,7 @@ test('partial settings writes are serialized and corrupt saved settings are neve
   const settings = new SettingsStore(filename);
   await settings.load();
   await settings.update({ telegram: { token: 'private-token', allowedChats: ['42'] } });
+  await settings.update({ ui: { startMinimized: true } });
   await Promise.all([
     settings.update({ ui: { theme: 'light' } }),
     settings.update({ shell: { enabled: false } }),
@@ -67,6 +60,7 @@ test('partial settings writes are serialized and corrupt saved settings are neve
   assert.equal(settings.get().ui.theme, 'light');
   assert.equal(settings.get().shell.enabled, false);
   assert.equal(settings.get().ui.locale, 'ru');
+  assert.equal(settings.get().ui.startMinimized, true);
   const reopened = new SettingsStore(filename);
   await reopened.load();
   assert.deepEqual(reopened.get(), settings.get());

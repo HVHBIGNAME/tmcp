@@ -34,17 +34,22 @@ export const defaultRules: ApprovalRules = {
   timeoutMs: 120000,
 };
 
-/**
- * Matches a command against the rules.
- *
- * Only the first line of the command is matched, so a here-doc or a piped script is not
- * hidden behind an allowed prefix.
- */
 export function decide(rules: ApprovalRules, command: string): Decision {
-  const target = command.split(/\r?\n/, 1)[0]!.trim();
+  const target = command.trim();
   const deny = compile(rules.deny);
-  const denied = deny(target);
+  const denied =
+    deny(target) ??
+    target
+      .split(/[\r\n;&|]+/)
+      .map((part) => deny(part.trim()))
+      .find(Boolean);
   if (denied) return { action: 'deny', rule: denied };
+  // Glob rules describe simple commands, not shell syntax. Compound expressions and
+  // substitutions require a decision about the whole script instead of its prefix.
+  if (/[\r\n;&|`$<>^]/.test(target) && rules.policy !== 'always')
+    return rules.policy === 'never'
+      ? { action: 'deny' }
+      : { action: 'ask', reason: 'Compound commands require approval' };
   const allow = compile(rules.allow);
   const allowed = allow(target);
   switch (rules.policy) {

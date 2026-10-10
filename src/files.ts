@@ -103,6 +103,7 @@ export class Files {
       for (const entry of await readdir(safeDirectory, { withFileTypes: true })) {
         if (!includeIgnored && entry.isDirectory() && ignoredDirectories.has(entry.name)) continue;
         const filename = path.join(safeDirectory, entry.name);
+        if (this.workspace.isPrivate(filename)) continue;
         const type = entry.isSymbolicLink()
           ? 'symlink'
           : entry.isDirectory()

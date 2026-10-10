@@ -40,17 +40,11 @@ try {
       : process.platform === 'darwin'
         ? `cloudflared-darwin-${arch}.tgz`
         : `cloudflared-linux-${arch}`;
-  const response = await fetch(
-    'https://api.github.com/repos/cloudflare/cloudflared/releases/latest',
-    { headers: { 'User-Agent': 'TMCP-installer' }, signal: AbortSignal.timeout(20000) },
+  const release = JSON.parse(
+    await readFile(new URL('./cloudflared-release.json', import.meta.url), 'utf8'),
   );
-  if (!response.ok)
-    throw new Error(
-      'Cannot read the Cloudflare release. Retry later (GitHub may be rate limiting).',
-    );
-  const release = await response.json();
   const asset = release.assets.find((item) => item.name === assetName);
-  if (!asset?.digest?.startsWith('sha256:'))
+  if (!/^sha256:[0-9a-f]{64}$/.test(asset?.digest ?? ''))
     throw new Error(
       `No verified Cloudflare download for ${assetName}. Install cloudflared manually and rerun.`,
     );

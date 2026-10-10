@@ -1,6 +1,6 @@
 {
   "name": "pc-mcp-tunnel",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "private": true,
   "description": "Authenticated PC development tools over MCP and Cloudflare Tunnel",
   "type": "module",
@@ -16,11 +16,15 @@
     "dev": "tsx src/main.ts",
     "build": "tsc -p tsconfig.json",
     "build:ui": "node scripts/build-icon.mjs && dotnet publish ui/PcMcp.csproj -c Release -r win-x64 -o dist-ui",
+    "build:standalone": "npm run build && node scripts/build-icon.mjs && node scripts/build-standalone.mjs",
     "app": "npm run build && npm run build:ui && .\\dist-ui\\PcMcp.exe",
     "check": "tsc -p tsconfig.check.json --noEmit",
     "test": "tsx --test tests/*.test.ts",
     "test:ui": "playwright test",
+    "test:a11y": "tsx scripts/audit-ui.ts",
     "test:desktop": "tsx tests/desktop-smoke.ts",
+    "test:standalone": "tsx tests/standalone-smoke.ts",
+    "test:lifecycle": "tsx scripts/check-lifecycle.ts --check",
     "start": "node dist/src/main.js",
     "tunnel": "node dist/src/main.js --tunnel quick",
     "tunnel:named": "node dist/src/main.js --tunnel named",
@@ -43,6 +47,7 @@
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.13.0",
     "@playwright/test": "^1.63.0",
     "@types/express": "^5.0.6",
     "@types/node": "^24.0.0",

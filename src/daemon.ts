@@ -7,6 +7,7 @@ import { SettingsStore, settingsPath } from './settings.js';
 import { acquireLock } from './runtime.js';
 import { configAt, serviceStatus, stopRequested } from './service-control.js';
 import { errorMessage } from './utils.js';
+import { ipcFetch } from './ipc.js';
 
 const projectDir = fileURLToPath(new URL('../../', import.meta.url));
 const config = configAt(projectDir);
@@ -38,15 +39,14 @@ try {
           process.execPath,
           [
             path.join(projectDir, 'dist', 'src', 'main.js'),
-            '--ui',
-            '--tunnel',
-            settings.get().tunnel.mode,
+            ...(process.env.MCP_LOCAL_ONLY === 'true'
+              ? []
+              : ['--tunnel', settings.get().tunnel.mode]),
           ],
           {
             cwd: projectDir,
             windowsHide: true,
             stdio: ['ignore', log.fd, log.fd],
-            env: { ...process.env, MCP_CONTROL_PORT: String(config.controlPort) },
           },
         );
         await new Promise<void>((resolve, reject) => {
@@ -66,9 +66,12 @@ try {
       }
     }
     try {
-      await delay(Math.min(30000, 2000 * Math.max(1, failures)), undefined, {
-        signal: abort.signal,
-      });
+      const nextAttempt = performance.now() + Math.min(30000, 2000 * Math.max(1, failures));
+      while (performance.now() < nextAttempt && !(await stopRequested(config))) {
+        await delay(Math.min(500, nextAttempt - performance.now()), undefined, {
+          signal: abort.signal,
+        });
+      }
     } catch {
       break;
     }
@@ -79,20 +82,22 @@ try {
 } finally {
   const live = await serviceStatus(config);
   if (live && (abort.signal.aborted || (await stopRequested(config)))) {
-    await fetch(`${config.localUrl}/_control/shutdown`, {
+    await ipcFetch(config.dataDir, '/_control/shutdown', {
       method: 'POST',
-      headers: { Authorization: `Bearer ${config.adminToken}` },
       signal: AbortSignal.timeout(5000),
     }).catch((error: unknown) => console.error(errorMessage(error)));
   }
   if (child && child.exitCode === null && child.signalCode === null) {
     const current = child;
-    await Promise.race([
-      new Promise<void>((resolve) => current.once('exit', () => resolve())),
-      delay(15000).then(() => {
-        if (current.exitCode === null) current.kill();
-      }),
-    ]);
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => {
+        if (current.exitCode === null && current.signalCode === null) current.kill();
+      }, 15000);
+      current.once('exit', () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
   }
   await unlock?.();
 }

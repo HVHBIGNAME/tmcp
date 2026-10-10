@@ -12,7 +12,7 @@ export interface Settings {
   shell: { enabled: boolean };
   gateway: { discover: boolean; mode: 'catalog' | 'namespaced' };
   tunnel: { mode: 'quick' | 'named'; hostname: string; tunnelToken: string };
-  ui: { theme: 'dark' | 'light'; locale: string };
+  ui: { theme: 'dark' | 'light'; locale: string; startMinimized: boolean };
 }
 
 const settingsSchema = z.object({
@@ -32,7 +32,11 @@ const settingsSchema = z.object({
     hostname: z.string(),
     tunnelToken: z.string(),
   }),
-  ui: z.object({ theme: z.enum(['dark', 'light']), locale: z.string() }),
+  ui: z.object({
+    theme: z.enum(['dark', 'light']),
+    locale: z.string(),
+    startMinimized: z.boolean().default(false),
+  }),
 });
 
 const settingsPatchSchema = z
@@ -57,7 +61,13 @@ const settingsPatchSchema = z
     shell: settingsSchema.shape.shell.partial().optional(),
     gateway: settingsSchema.shape.gateway.partial().optional(),
     tunnel: settingsSchema.shape.tunnel.partial().optional(),
-    ui: settingsSchema.shape.ui.partial().optional(),
+    ui: z
+      .object({
+        theme: z.enum(['dark', 'light']).optional(),
+        locale: z.string().optional(),
+        startMinimized: z.boolean().optional(),
+      })
+      .optional(),
   })
   .strict();
 
@@ -69,7 +79,7 @@ export const defaultSettings: Settings = {
   shell: { enabled: true },
   gateway: { discover: true, mode: 'catalog' },
   tunnel: { mode: 'quick', hostname: '', tunnelToken: '' },
-  ui: { theme: 'dark', locale: 'ru' },
+  ui: { theme: 'dark', locale: 'ru', startMinimized: false },
 };
 
 export interface RedactedSettings extends Settings {

@@ -1,4 +1,5 @@
-import { ControlClient, StatePoller } from './api.js';
+import { ActivityStream, ControlClient, StatePoller } from './api.js';
+import { TrafficPanel } from './traffic.js';
 import { icon } from './icons.js';
 import {
   el,
@@ -17,10 +18,11 @@ import {
   secretModal,
   dateTime,
   relativeTime,
+  setDisabled,
 } from './components.js';
 
 const pages = {
-  overview: ['Подключение', 'Ваш компьютер — в одном подключении', 'connection'],
+  overview: ['Подключение', 'Адрес сервера и поток запросов', 'connection'],
   tokens: ['Доступ', 'Токены и разрешения для ваших интеграций', 'key'],
   approvals: ['Запросы', 'Подтверждения и правила запуска команд', 'requests'],
   servers: ['MCP-серверы', 'Локальные инструменты, доступные через туннель', 'servers'],
@@ -39,7 +41,7 @@ const permissions = {
 };
 
 const connectionLabels = {
-  connected: ['Туннель подключён', 'success'],
+  connected: ['Туннель зарегистрирован', 'neutral'],
   starting: ['Подключаем туннель', 'warning'],
   reconnecting: ['Восстанавливаем туннель', 'warning'],
   error: ['Нужна проверка настроек', 'error'],
@@ -61,6 +63,25 @@ export function createControlApp() {
   let disposed = false;
   const ui = buildShell();
   const poller = new StatePoller(client, update, disconnected);
+  const trafficRecords = new Map();
+  const stream = new ActivityStream(client, receiveTraffic, (connected) => {
+    state.streamConnected = connected;
+    currentPage?.streamConnected?.(connected);
+  });
+
+  function receiveTraffic(event) {
+    if (disposed || !event || !Number.isSafeInteger(event.sequence)) return;
+    if (state.traffic?.instanceId !== event.instanceId) trafficRecords.clear();
+    else if (event.sequence <= state.traffic.sequence) return;
+    if (event.type === 'snapshot') {
+      trafficRecords.clear();
+      for (const record of event.records ?? []) trafficRecords.set(record.id, record);
+    } else if (event.record) trafficRecords.set(event.record.id, event.record);
+    const records = [...trafficRecords.values()].sort((a, b) => b.order - a.order);
+    for (const record of records.slice(150)) trafficRecords.delete(record.id);
+    state.traffic = { ...event, records: records.slice(0, 150) };
+    currentPage?.trafficUpdate?.(state.traffic, event.type === 'update');
+  }
 
   function buildShell() {
     const navButtons = {};
@@ -75,6 +96,7 @@ export function createControlApp() {
       );
       item.setAttribute('data-view', key);
       item.setAttribute('aria-label', label);
+      item.title = label;
       if (key === 'overview') item.setAttribute('aria-current', 'page');
       if (key === 'approvals') item.append(count);
       if (key === 'settings') item.classList.add('nav-settings');
@@ -104,7 +126,6 @@ export function createControlApp() {
               el('span', { textContent: 'Рабочая станция' }),
             ]),
           ]),
-          el('div', { className: 'nav-caption', textContent: 'ПРОСТРАНСТВО' }),
           nav,
           el('div', { className: 'sidebar-bottom' }, [
             localStatus,
@@ -190,6 +211,8 @@ export function createControlApp() {
   function update(data) {
     if (disposed) return;
     state.data = data;
+    receiveTraffic(data.traffic);
+    if (!document.hidden) stream.start();
     state.online = true;
     lastUpdate = new Date();
     ui.banner.hidden = true;
@@ -225,6 +248,14 @@ export function createControlApp() {
       ? `Последний ответ: ${lastUpdate.toLocaleTimeString('ru-RU')}`
       : 'Ожидаем запуск сервера';
     currentPage?.connectionLost?.();
+    if (!state.data && !window.chrome?.webview)
+      ui.view.replaceChildren(
+        emptyState(
+          'connection',
+          'Откройте приложение PC MCP',
+          'Панель управляет сервером через защищённый локальный канал. Запустите PcMcp.exe; на Linux и macOS используйте tmcp.',
+        ),
+      );
   }
 
   async function mutate(path, method, body, timeout) {
@@ -233,7 +264,7 @@ export function createControlApp() {
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       ...(timeout ? { timeout } : {}),
     });
-    await poller.refresh();
+    void poller.refresh();
     return result;
   }
 
@@ -246,7 +277,7 @@ export function createControlApp() {
     document.documentElement.dataset.theme = settings.ui.theme;
     window.chrome?.webview?.postMessage({ type: 'theme', theme: settings.ui.theme });
     toast('Настройки сохранены');
-    await poller.refresh();
+    void poller.refresh();
   }
 
   function restartServer() {
@@ -278,6 +309,7 @@ export function createControlApp() {
   }
 
   function overview() {
+    const flow = new TrafficPanel();
     const endpoint = input('', {
       readOnly: true,
       className: 'endpoint-input',
@@ -295,11 +327,13 @@ export function createControlApp() {
     );
     copyButton.disabled = true;
     const checkResult = el('div', { className: 'check-result', role: 'status', hidden: true });
+    let lastCheck = null;
     const checkButton = button('Проверить доступность', 'bolt', async () => {
+      const url = state.data.connection.mcpUrl;
       const result = await client.call('/connection/check', { method: 'POST', timeout: 15000 });
-      checkResult.className = `check-result ${result.ok ? 'success-tone' : 'warning-tone'}`;
-      checkResult.textContent = result.message + (result.ok ? ` ${result.latencyMs} мс.` : '');
-      checkResult.hidden = false;
+      if (state.data.connection.mcpUrl !== url) return;
+      lastCheck = { ...result, url };
+      renderConnection(state.data.connection);
     });
     const mode = el('span', { className: 'eyebrow' });
     const local = el('code', { className: 'local-endpoint' });
@@ -307,20 +341,13 @@ export function createControlApp() {
     const activity = el('div', { className: 'activity-list' });
     const pending = el('div');
     const node = el('div', { className: 'page-stack' }, [
-      el('section', { className: 'connection-hero' }, [
+      el('section', { className: 'connection-hero connection-compact' }, [
         el('div', { className: 'hero-top' }, [mode, connectionBadge]),
-        el('div', { className: 'hero-body' }, [
-          el('div', {}, [title, description]),
-          el('div', { className: 'connection-art', 'aria-hidden': 'true' }, [
-            el('div', { className: 'art-node' }, icon('monitor')),
-            el('span', { className: 'art-line' }),
-            el('div', { className: 'art-node art-cloud' }, icon('cloud')),
-          ]),
-        ]),
+        el('div', { className: 'hero-body' }, [el('div', {}, [title, description])]),
         el('div', { className: 'endpoint-box' }, [
           el('div', { className: 'endpoint-label' }, [
             icon('link'),
-            el('span', { textContent: 'Адрес для Notion и других MCP-клиентов' }),
+            el('span', { textContent: 'Адрес MCP для ваших интеграций' }),
           ]),
           el('div', { className: 'endpoint-copy' }, [endpoint, copyButton]),
         ]),
@@ -336,6 +363,7 @@ export function createControlApp() {
       ]),
       metrics,
       pending,
+      flow.node,
       el('div', { className: 'overview-grid' }, [
         panel(
           'Последние действия',
@@ -376,34 +404,59 @@ export function createControlApp() {
     let activityKey = '';
     let metricsKey = '';
     let pendingCount = -1;
+    function renderConnection(c) {
+      if (!c?.mcpUrl || lastCheck?.url !== c.mcpUrl) lastCheck = null;
+      const [label, tone] = connectionLabels[c?.status] ?? connectionLabels.starting;
+      connectionBadge.replaceChildren(
+        badge(
+          lastCheck ? (lastCheck.ok ? 'Проверка пройдена' : 'Проверка не пройдена') : label,
+          lastCheck ? (lastCheck.ok ? 'success' : 'warning') : tone,
+        ),
+      );
+      mode.textContent =
+        c?.mode === 'named' ? 'Постоянный адрес Cloudflare' : 'Временный адрес Cloudflare';
+      title.textContent = c?.mcpUrl
+        ? lastCheck
+          ? lastCheck.ok
+            ? 'Внешний адрес проверен'
+            : 'Внешний адрес не отвечает'
+          : 'Туннель зарегистрирован'
+        : c?.status === 'local'
+          ? 'Включите внешний туннель'
+          : 'Готовим внешнее подключение';
+      description.textContent = c?.mcpUrl
+        ? lastCheck
+          ? 'Результат последней проверки. При проблемах с подключением проверьте адрес повторно.'
+          : 'Адрес получен. Нажмите «Проверить доступность», чтобы проверить ответ через интернет.'
+        : c?.lastError
+          ? 'Туннель восстанавливается. Детали и параметры доступны в настройках.'
+          : 'Адрес появится здесь автоматически. Локальный сервер уже работает.';
+      checkResult.hidden = !lastCheck;
+      if (lastCheck) {
+        checkResult.className = `check-result ${lastCheck.ok ? 'success-tone' : 'warning-tone'}`;
+        checkResult.textContent =
+          lastCheck.message + (lastCheck.ok ? ` ${lastCheck.latencyMs} мс.` : '');
+      }
+      if (endpoint.value !== (c?.mcpUrl ?? '')) endpoint.value = c?.mcpUrl ?? '';
+      setDisabled(copyButton, !c?.mcpUrl || !state.online);
+      setDisabled(checkButton, !c?.mcpUrl || !state.online);
+      local.textContent = `${c?.localUrl ?? ''}/mcp`;
+    }
     return {
       node,
+      dispose: () => flow.dispose(),
+      trafficUpdate: (data, animate) => flow.update(data, animate),
+      streamConnected: (connected) => flow.setConnected(connected),
       connectionLost: () => {
-        copyButton.disabled = true;
-        checkButton.disabled = true;
+        setDisabled(copyButton, true);
+        setDisabled(checkButton, true);
+        flow.setConnected(false);
       },
       update(data) {
-        const c = data.connection;
-        const [label, tone] = connectionLabels[c?.status] ?? connectionLabels.starting;
-        connectionBadge.replaceChildren(badge(label, tone));
-        mode.textContent =
-          c?.mode === 'named' ? 'ПОСТОЯННЫЙ АДРЕС · CLOUDFLARE' : 'ВРЕМЕННЫЙ АДРЕС · CLOUDFLARE';
-        title.textContent = c?.mcpUrl
-          ? 'Ваш компьютер доступен извне'
-          : c?.status === 'local'
-            ? 'Включите внешний туннель'
-            : 'Готовим внешнее подключение';
-        description.textContent = c?.mcpUrl
-          ? c.mode === 'quick'
-            ? 'Ссылка действует, пока работает этот туннель. Для постоянного адреса добавьте свой домен.'
-            : 'Постоянная ссылка готова для ваших интеграций.'
-          : c?.lastError
-            ? 'Туннель восстанавливается. Детали и параметры доступны в настройках.'
-            : 'Адрес появится здесь автоматически. Локальный сервер уже работает.';
-        if (endpoint.value !== (c?.mcpUrl ?? '')) endpoint.value = c?.mcpUrl ?? '';
-        copyButton.disabled = !c?.mcpUrl || !state.online;
-        checkButton.disabled = !c?.mcpUrl || !state.online;
-        local.textContent = `${c?.localUrl ?? ''}/mcp`;
+        flow.setTokens(data.tokens);
+        flow.update(state.traffic);
+        flow.setConnected(Boolean(state.streamConnected));
+        renderConnection(data.connection);
         const nextMetrics = JSON.stringify([
           data.tokens,
           data.gateway.servers,
@@ -505,13 +558,13 @@ export function createControlApp() {
 
   function editToken(token) {
     const name = input(token?.name ?? '', { placeholder: 'Например, Notion', maxLength: 64 });
-    const chosen = new Set(
-      token?.permissions ?? ['files:read', 'files:write', 'shell', 'screen', 'gateway'],
-    );
+    const chosen = new Set(token?.permissions ?? ['files:read']);
     modal({
       title: token ? `Доступ: ${token.name}` : 'Новый токен',
       glyph: 'key',
-      description: 'Выберите, что сможет делать эта интеграция.',
+      description: token
+        ? 'Выберите, что сможет делать эта интеграция.'
+        : 'По умолчанию разрешено только чтение файлов. Дополнительные права включайте по необходимости.',
       content: el('div', {}, [
         token ? null : field('Имя интеграции', name),
         permissionPicker(chosen),
@@ -604,7 +657,9 @@ export function createControlApp() {
                       el('h3', { textContent: token.name }),
                       el('p', {
                         className: 'muted',
-                        textContent: `Последнее использование: ${relativeTime(token.lastUsedAt)}`,
+                        textContent: token.lastUsedAt
+                          ? `Использован ${relativeTime(token.lastUsedAt).toLowerCase()}`
+                          : 'Ещё не использовался',
                       }),
                     ]),
                   ]),
@@ -663,34 +718,6 @@ export function createControlApp() {
       );
     };
     search.addEventListener('input', () => draw(state.data, true));
-    const owner = el('details', { className: 'panel advanced-access' }, [
-      el('summary', { textContent: 'Ключ владельца · дополнительные настройки' }),
-      el('p', {
-        className: 'muted',
-        textContent:
-          'Полный доступ из .env. Меняйте этот ключ только при необходимости; потребуется перезапуск сервера.',
-      }),
-      button('Заменить ключ владельца', 'refresh', () => {
-        const current = input('', { type: 'password', autocomplete: 'off' });
-        modal({
-          title: 'Заменить ключ владельца?',
-          glyph: 'shield',
-          description:
-            'Введите текущий MCP_TOKEN. Новый ключ будет записан в .env и начнёт действовать после перезапуска сервера.',
-          content: field('Текущий ключ владельца', current),
-          submitLabel: 'Заменить ключ',
-          onSubmit: async () => {
-            if (!current.value.trim()) throw new Error('Введите текущий ключ владельца.');
-            const result = await client.call('/owner-token/rotate', {
-              method: 'POST',
-              body: JSON.stringify({ current: current.value.trim() }),
-            });
-            current.value = '';
-            return () => secretModal('Ключ владельца · применится после перезапуска', result.token);
-          },
-        });
-      }),
-    ]);
     return {
       node: el('div', { className: 'page-stack' }, [
         el('div', { className: 'page-toolbar' }, [
@@ -701,9 +728,8 @@ export function createControlApp() {
         el('p', {
           className: 'section-note',
           textContent:
-            'Токен показывается только при создании. Для каждой интеграции удобно использовать отдельный ключ.',
+            'Доступ дают только выпущенные здесь ключи — напрямую или через OAuth. Ключ показывается один раз; отключение также отзывает связанные OAuth-подключения.',
         }),
-        owner,
       ]),
       update: draw,
     };
@@ -1156,6 +1182,7 @@ export function createControlApp() {
                 await client.call('/autostart', {
                   method: 'PATCH',
                   body: JSON.stringify({ enabled }),
+                  timeout: 65000,
                 }),
               );
               toast(enabled ? 'Автозапуск включён' : 'Автозапуск выключен');
@@ -1176,6 +1203,26 @@ export function createControlApp() {
       .catch((error) => {
         startupHost.textContent = error.message;
       });
+    let savingMinimized = false;
+    const minimized = toggle(
+      'Запускать свёрнутым в трей',
+      'При следующем запуске окно останется скрытым. Нажмите значок TMCP в трее, чтобы открыть его.',
+      settings.ui.startMinimized,
+      async (event) => {
+        const enabled = event.target.checked;
+        event.target.disabled = true;
+        savingMinimized = true;
+        try {
+          await save({ ui: { startMinimized: enabled } });
+        } catch (error) {
+          event.target.checked = !enabled;
+          toast(error.message, 'error');
+        } finally {
+          event.target.disabled = false;
+          savingMinimized = false;
+        }
+      },
+    );
     const general = formPanel(
       'Возможности компьютера',
       'Разрешения каждого токена дополнительно ограничивают доступ.',
@@ -1196,7 +1243,7 @@ export function createControlApp() {
           nodes: [
             toggle(
               'Запуск команд',
-              'Выполнение команд в разрешённых рабочих папках',
+              'Запуск кода с правами вашего пользователя ОС; рабочая папка не является песочницей',
               values.shell,
               (event) => {
                 values.shell = event.target.checked;
@@ -1337,16 +1384,41 @@ export function createControlApp() {
         general,
         tunnel,
         theme,
-        panel('Автозапуск', 'Включается отдельно и применяется сразу.', startupHost),
+        panel(
+          'Автозагрузка и трей',
+          'При включении автозагрузки самостоятельный EXE устанавливается в постоянное место.',
+          el('div', {}, [startupHost, minimized]),
+        ),
         panel(
           'Обслуживание',
           `Сервер работает с ${dateTime(data.startedAt)}. Перезапуск сервера остановит активные команды.`,
           el('div', { className: 'button-group' }, [
             button('Переподключить туннель', 'cloud', restartTunnel),
             button('Перезапустить сервер', 'refresh', restartServer),
+            window.chrome?.webview
+              ? button('Меню трея', 'settings', () =>
+                  window.chrome.webview.postMessage({ type: 'tray-menu' }),
+                )
+              : null,
+            window.chrome?.webview
+              ? button('Завершить работу', 'power', () =>
+                  modal({
+                    title: 'Остановить сервер и выйти?',
+                    glyph: 'power',
+                    description:
+                      'Активные команды и туннель будут остановлены. Приложение закроется после завершения процессов.',
+                    submitLabel: 'Остановить и выйти',
+                    onSubmit: () => () => window.chrome.webview.postMessage({ type: 'quit' }),
+                  }),
+                )
+              : null,
           ]),
         ),
       ]),
+      update(next) {
+        if (!savingMinimized)
+          minimized.querySelector('input').checked = next.settings.ui.startMinimized;
+      },
     };
   }
 
@@ -1356,13 +1428,18 @@ export function createControlApp() {
       .map((line) => line.trim())
       .filter(Boolean);
   const wake = () => {
-    if (!document.hidden) void poller.refresh();
+    if (document.hidden) stream.stop();
+    else {
+      void poller.refresh();
+      if (state.data) stream.start();
+    }
   };
   document.addEventListener('visibilitychange', wake);
   window.addEventListener('online', wake);
   const hostMessage = (event) => {
     const message = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
     if (message?.type === 'server-ready') void poller.refresh();
+    if (message?.type === 'navigate' && Object.hasOwn(pages, message.page)) navigate(message.page);
   };
   window.chrome?.webview?.addEventListener('message', hostMessage);
   void poller.refresh();
@@ -1372,6 +1449,7 @@ export function createControlApp() {
       disposed = true;
       currentPage?.dispose?.();
       poller.stop();
+      stream.stop();
       document.removeEventListener('visibilitychange', wake);
       window.removeEventListener('online', wake);
       window.chrome?.webview?.removeEventListener('message', hostMessage);

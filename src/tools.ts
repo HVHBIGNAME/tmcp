@@ -1,5 +1,6 @@
 import os from 'node:os';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { version } from './version.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import type { Config } from './config.js';
@@ -12,6 +13,7 @@ import { registerGatewayTools } from './gateway/tools.js';
 import type { Approvals, AuditLog } from './approvals.js';
 import type { SettingsStore } from './settings.js';
 import type { Permission } from './permissions.js';
+import type { TrafficSpan } from './traffic.js';
 
 export type Logger = (event: Record<string, unknown>) => void;
 
@@ -24,6 +26,7 @@ export interface ToolServices {
   approvals: Approvals;
   audit: AuditLog;
   settings: SettingsStore;
+  traffic?: TrafficSpan;
 }
 
 /** Identifies the authenticated caller and what it is allowed to do. */
@@ -32,6 +35,7 @@ export interface Caller {
   permissions: Permission[];
   /** Set for shared tokens, so the audit log can name the token instead of a client ID. */
   tokenName?: string;
+  tokenId?: string;
 }
 
 const pathInput = z
@@ -93,7 +97,7 @@ export function createMcpServer(services: ToolServices, caller: Caller): McpServ
   const { config, files, processes, log, approvals, audit, settings } = services;
   const owner = caller.id;
   const server = new McpServer(
-    { name: 'pc-mcp-tunnel', version: '1.1.0' },
+    { name: 'pc-mcp-tunnel', version },
     {
       instructions:
         "Development tools on the owner's PC. Call system_info first. Relative paths use the first workspace root. Read files before editing; use sha256 for conflict detection. run_command returns a job_id: poll read_command using its output cursors until completion. Commands execute as the OS user, not in a sandbox, and may require the owner's approval. Screenshots are MCP image content. Do not assume the client can display images. Only act within the user's requested task.",
@@ -130,26 +134,23 @@ export function createMcpServer(services: ToolServices, caller: Caller): McpServ
         outcome,
         durationMs,
       })
-      .catch(() => undefined);
+      .catch((error: unknown) => log({ event: 'audit_write_error', message: errorMessage(error) }));
   }
 
   async function execute(
     name: string,
     operation: () => Promise<CallToolResult>,
-    /**
-     * Runs after the permission check but before the tool body.
-     *
-     * Used by run_command so a caller without shell rights is refused immediately instead
-     * of being asked to approve a command it may never run.
-     */
+    /** Owner approval runs only after the caller's permission check. */
     gate?: () => Promise<void>,
   ): Promise<CallToolResult> {
     if (!(name in toolPermission)) {
+      services.traffic?.deny();
       await record(name, '', 'denied', null);
       return { isError: true, content: [{ type: 'text', text: `Unknown tool: ${name}` }] };
     }
     const required = toolPermission[name as keyof typeof toolPermission];
     if (required && !caller.permissions.includes(required)) {
+      services.traffic?.deny();
       await record(name, '', 'denied', null);
       return refusal(name, required);
     }
@@ -163,7 +164,9 @@ export function createMcpServer(services: ToolServices, caller: Caller): McpServ
       )
         throw new Error('Screenshots are disabled by the owner in PC MCP settings.');
       if (gate) await gate();
+      services.traffic?.running(name);
       const result = await operation();
+      services.traffic?.result(Boolean(result.isError));
       log({
         event: 'tool',
         tool: name,
@@ -174,6 +177,7 @@ export function createMcpServer(services: ToolServices, caller: Caller): McpServ
       if (!result.isError) await record(name, '', 'executed', Date.now() - start);
       return result;
     } catch (error) {
+      services.traffic?.result(true);
       log({ event: 'tool', tool: name, client: owner, ok: false, duration_ms: Date.now() - start });
       await record(name, '', 'failed', Date.now() - start);
       return { isError: true, content: [{ type: 'text', text: errorMessage(error) }] };
@@ -193,6 +197,7 @@ export function createMcpServer(services: ToolServices, caller: Caller): McpServ
       cwd: resolved,
       clientId: owner,
       rules: settings.get().approval,
+      onWait: () => services.traffic?.waiting(),
     });
     await record(
       'run_command',
@@ -200,10 +205,12 @@ export function createMcpServer(services: ToolServices, caller: Caller): McpServ
       outcome.action === 'allow' ? 'allowed' : 'denied',
       Date.now() - started,
     );
-    if (outcome.action === 'deny')
+    if (outcome.action === 'deny') {
+      services.traffic?.deny();
       throw new Error(
         'The owner did not allow this command. Ask before proposing a different command.',
       );
+    }
   }
 
   function json(
@@ -239,6 +246,7 @@ export function createMcpServer(services: ToolServices, caller: Caller): McpServ
         arch: os.arch(),
         hostname: os.hostname(),
         node: process.version,
+        node_executable: process.execPath,
         roots: files.workspace.roots,
         shell_enabled: config.shellEnabled,
         screenshots_enabled: config.screenshotsEnabled,
@@ -551,6 +559,7 @@ export function createMcpServer(services: ToolServices, caller: Caller): McpServ
           .slice(0, limit),
       })),
   );
-  if (caller.permissions.includes('gateway')) registerGatewayTools(server, services.gateway, owner);
+  if (caller.permissions.includes('gateway'))
+    registerGatewayTools(server, services.gateway, owner, services.traffic);
   return server;
 }

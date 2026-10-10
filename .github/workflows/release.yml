@@ -14,8 +14,12 @@ permissions:
 
 jobs:
   core:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -26,18 +30,14 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run check
+      - run: npm run format:check
       - run: npm test
       - run: npm run build
-      - run: node scripts/package.mjs
-      - uses: actions/upload-artifact@v4
-        with:
-          name: core
-          path: |
-            release/tmcp-core.zip
-            release/tmcp-core.tar.gz
+      - run: npm run test:lifecycle
+      - run: sh -n install.sh
   windows:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,34 +49,46 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 8.0.x
+      - uses: actions/cache@v4
+        with:
+          path: .mcp-tunnel/build-cache
+          key: windows-runtimes-${{ hashFiles('scripts/windows-runtime.json', 'scripts/cloudflared-release.json') }}
       - run: npm ci
-      - run: node scripts/build-icon.mjs
-      - run: dotnet publish ui/PcMcp.csproj -c Release -r win-x64 --self-contained true -o dist-ui
-      - run: node scripts/package.mjs --gui
+      - run: npm run check
+      - run: npm test
+      - run: npm run build:standalone
+      - run: npm run test:standalone
       - uses: actions/upload-artifact@v4
         with:
-          name: windows
-          path: release/tmcp-windows-x64.zip
+          name: standalone
+          path: release/TMCP.exe
+          compression-level: 0
+          if-no-files-found: error
   publish:
     needs: [core, windows]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
+          name: standalone
           path: release
-          merge-multiple: true
-      - name: Publish verified archives
+      - name: Publish the single verified EXE
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          cd release
-          sha256sum tmcp-core.tar.gz tmcp-core.zip tmcp-windows-x64.zip > SHA256SUMS.txt
-          gh release create "$RELEASE_TAG" --verify-tag --generate-notes --title "TMCP $RELEASE_TAG" ./*
+          DIGEST=$(sha256sum release/TMCP.exe | cut -d ' ' -f 1)
+          printf '## Windows x64\n\nDownload **TMCP.exe** and run it. Node.js, .NET, Fixed WebView2 and cloudflared are included. The first launch extracts components into %%LOCALAPPDATA%%\\TMCP.\n\nEnable autostart in Settings to install the EXE permanently. Minimized startup is optional; the tray menu has a confirmed full shutdown. Existing app-issued keys and settings are preserved for the same home directory. To keep a previous installation, start it with `--home "C:\\path\\to\\old"`.\n\nLinux/macOS: `install.sh` from the tagged source builds the CLI.\n\nSHA-256: `%s`\n' "$DIGEST" > notes.md
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release/TMCP.exe --clobber
+            gh release edit "$RELEASE_TAG" --notes-file notes.md
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --notes-file notes.md --title "TMCP $RELEASE_TAG" release/TMCP.exe
+          fi
   install-smoke:
     needs: publish
     strategy:
@@ -84,7 +96,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -111,3 +123,4 @@ jobs:
         run: |
           ./install.ps1 -Mode cli -InstallDir "$env:RUNNER_TEMP/tmcp-installed" -Root "$env:RUNNER_TEMP" -Version $env:RELEASE_TAG -NoStart -NoPathUpdate
           & "$env:RUNNER_TEMP/tmcp-installed/bin/tmcp.cmd" --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -2,7 +2,7 @@ import { mkdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { allPermissions, parsePermissions, type Permission } from '../permissions.js';
+import { parsePermissions, type Permission } from '../permissions.js';
 import { atomicWrite, hash, isErrno, SerialQueue, token } from '../utils.js';
 
 const recordSchema = z.object({
@@ -14,7 +14,7 @@ const recordSchema = z.object({
   enabled: z.boolean(),
   createdAt: z.string(),
   lastUsedAt: z.string().nullable(),
-  expiresAt: z.string().nullable(),
+  expiresAt: z.iso.datetime().nullable(),
 });
 
 const storeSchema = z.object({ version: z.literal(1), tokens: z.array(recordSchema) });
@@ -42,15 +42,11 @@ export interface CreateTokenInput {
   expiresAt?: string | null;
 }
 
-/**
- * Stores shared API tokens.
- *
- * Only hashes are kept on disk, so a leaked data directory cannot be replayed against
- * the server. Each token carries its own permission set and can be rotated or revoked
- * independently of the owner secrets in the environment.
- */
+/** Shared-token hashes, permissions and revocation state. */
 export class TokenStore {
   private readonly writes = new SerialQueue();
+  private readonly usage = new Map<string, string>();
+  private nextUsageWrite = 0;
 
   private constructor(
     private readonly filename: string,
@@ -87,7 +83,7 @@ export class TokenStore {
       permissions: [...record.permissions],
       enabled: record.enabled,
       createdAt: record.createdAt,
-      lastUsedAt: record.lastUsedAt,
+      lastUsedAt: this.usage.get(record.id) ?? record.lastUsedAt,
       expiresAt: record.expiresAt,
     };
   }
@@ -96,23 +92,59 @@ export class TokenStore {
   find(presented: string): { id: string; permissions: Permission[] } | undefined {
     const digest = hash(presented);
     const record = this.data.tokens.find((candidate) => candidate.tokenHash === digest);
-    if (!record || !record.enabled) return undefined;
+    if (!record) return undefined;
+    const permissions = this.active(record);
+    return permissions ? { id: record.id, permissions } : undefined;
+  }
+
+  /**
+   * Re-checks a token an OAuth grant is bound to.
+   *
+   * A grant outlives the browser session that created it, so pausing, rotating or
+   * deleting the token has to stop it here as well.
+   */
+  activeById(id: string, tokenHash: string): Permission[] | undefined {
+    const record = this.data.tokens.find((candidate) => candidate.id === id);
+    if (!record || record.tokenHash !== tokenHash) return undefined;
+    return this.active(record);
+  }
+
+  private active(record: TokenRecord): Permission[] | undefined {
+    if (!record.enabled) return undefined;
     if (record.expiresAt && Date.parse(record.expiresAt) <= Date.now()) return undefined;
-    return { id: record.id, permissions: record.permissions };
+    return [...record.permissions];
   }
 
   async touch(id: string): Promise<void> {
     const record = this.data.tokens.find((candidate) => candidate.id === id);
-    if (!record || record.lastUsedAt === new Date().toISOString()) return;
-    await this.writes.run(async () => {
+    if (!record) return;
+    this.usage.set(id, new Date().toISOString());
+    if (Date.now() < this.nextUsageWrite) return;
+    this.nextUsageWrite = Date.now() + 30000;
+    try {
+      await this.flushUsage();
+    } catch (error) {
+      this.nextUsageWrite = 0;
+      throw error;
+    }
+  }
+
+  flushUsage(): Promise<void> {
+    return this.writes.run(async () => {
+      if (!this.usage.size) return;
+      const updates = new Map(this.usage);
       const draft = structuredClone(this.data);
-      const target = draft.tokens.find((candidate) => candidate.id === id);
-      if (target) target.lastUsedAt = new Date().toISOString();
+      for (const target of draft.tokens) {
+        const at = updates.get(target.id);
+        if (at) target.lastUsedAt = at;
+      }
       await this.persist(draft);
+      for (const [id, at] of updates) if (this.usage.get(id) === at) this.usage.delete(id);
     });
   }
 
   async create(input: CreateTokenInput): Promise<IssuedToken> {
+    const expiresAt = recordSchema.shape.expiresAt.parse(input.expiresAt ?? null);
     const permissions = parsePermissions(input.permissions);
     if (!permissions.length) throw new Error('A token needs at least one permission');
     const name = input.name.trim();
@@ -131,7 +163,7 @@ export class TokenStore {
         enabled: input.enabled ?? true,
         createdAt: new Date().toISOString(),
         lastUsedAt: null,
-        expiresAt: input.expiresAt ?? null,
+        expiresAt,
       };
       draft.tokens.push(record);
       await this.persist(draft);
@@ -139,7 +171,6 @@ export class TokenStore {
     });
   }
 
-  /** Replaces the secret of an existing token, keeping its name and permissions. */
   async rotate(id: string): Promise<IssuedToken> {
     return this.writes.run(async () => {
       const draft = structuredClone(this.data);
@@ -149,6 +180,7 @@ export class TokenStore {
       record.tokenHash = hash(secret);
       record.lastUsedAt = null;
       await this.persist(draft);
+      this.usage.delete(id);
       return { ...this.view(record), token: secret };
     });
   }
@@ -163,7 +195,8 @@ export class TokenStore {
       if (!record) throw new Error('Unknown token');
       if (changes.permissions) record.permissions = parsePermissions(changes.permissions);
       if (changes.enabled !== undefined) record.enabled = changes.enabled;
-      if (changes.expiresAt !== undefined) record.expiresAt = changes.expiresAt;
+      if (changes.expiresAt !== undefined)
+        record.expiresAt = recordSchema.shape.expiresAt.parse(changes.expiresAt);
       await this.persist(draft);
       return this.view(record);
     });
@@ -175,9 +208,10 @@ export class TokenStore {
       if (!draft.tokens.some((candidate) => candidate.id === id)) throw new Error('Unknown token');
       draft.tokens = draft.tokens.filter((candidate) => candidate.id !== id);
       await this.persist(draft);
+      this.usage.delete(id);
     });
   }
 
   /** Permissions pre-selected for a new token in the GUI. */
-  static readonly defaultPermissions = allPermissions.filter((value) => value !== 'log');
+  static readonly defaultPermissions: readonly Permission[] = ['files:read'];
 }

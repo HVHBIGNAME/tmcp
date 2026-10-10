@@ -5,6 +5,7 @@ import { parse, printParseErrorCode, type ParseError } from 'jsonc-parser';
 import { parse as parseEnv } from 'dotenv';
 import type { Config } from '../config.js';
 import { hash, isErrno } from '../utils.js';
+import { secretRedactor } from '../redaction.js';
 
 interface CommonServer {
   id: string;
@@ -65,7 +66,7 @@ async function expand(value: string, cwd: string, env: NodeJS.ProcessEnv): Promi
       return replacement;
     },
   );
-  for (const match of [...result.matchAll(/\{file:([^}]+)\}/g)]) {
+  for (const match of result.matchAll(/\{file:([^}]+)\}/g)) {
     const filename = path.resolve(cwd, homePath(match[1]!));
     const content = await readFile(filename, 'utf8');
     if (content.length > 65536) throw new Error('An interpolated credential file exceeds 64 KiB');
@@ -290,12 +291,32 @@ export function publicServer(spec: ServerSpec) {
   return { id: spec.id, name: spec.name, transport: spec.kind, sources: spec.sources };
 }
 
+/**
+ * Removes credentials from anything a backend printed.
+ *
+ * A stdio backend can be launched with its secret interpolated into the command or its
+ * arguments, and a remote one can carry it in the query string, so those are scrubbed
+ * as well as the environment and headers.
+ */
+export function backendSecrets(spec: ServerSpec): string[] {
+  const values =
+    spec.kind === 'stdio'
+      ? [...Object.values(spec.env), spec.command, ...spec.args]
+      : [...Object.values(spec.headers), spec.url];
+  const secrets = [...values, ...values.map((value) => value.replace(/^Bearer\s+/i, ''))];
+  if (spec.kind === 'stdio') {
+    for (const argument of spec.args) {
+      const assignment = /^--?[\w-]+=(.+)$/.exec(argument);
+      if (assignment?.[1]) secrets.push(assignment[1]);
+    }
+  } else {
+    const url = new URL(spec.url);
+    secrets.push(url.password, url.username, ...url.searchParams.values());
+    if (url.pathname !== '/') secrets.push(`${url.origin}${url.pathname}`);
+  }
+  return secrets;
+}
+
 export function redact(spec: ServerSpec, message: string): string {
-  const secrets = spec.kind === 'stdio' ? Object.values(spec.env) : Object.values(spec.headers);
-  let output = message;
-  for (const secret of secrets)
-    if (secret.length >= 4) output = output.split(secret).join('[redacted]');
-  if (spec.kind !== 'stdio')
-    output = output.split(spec.url).join(`${new URL(spec.url).origin}/[redacted-path]`);
-  return output.slice(0, 2000);
+  return secretRedactor(backendSecrets(spec))(message).slice(0, 2000);
 }

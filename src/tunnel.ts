@@ -5,6 +5,7 @@ import { childEnvironment } from './config.js';
 import { terminateTree } from './processes.js';
 import { atomicWrite, errorMessage } from './utils.js';
 import type { Logger } from './tools.js';
+import { redactedStream } from './redaction.js';
 
 export interface CloudflareTunnel {
   url: string;
@@ -12,8 +13,10 @@ export interface CloudflareTunnel {
   stop(): Promise<void>;
 }
 
-const registrationLost =
-  /Tunnel not found|Unauthorized|Invalid tunnel credentials|Connection terminated|Register tunnel error|failed to serve incoming request/i;
+const registrationFailed =
+  /Tunnel not found|Unauthorized|Invalid tunnel credentials|Register tunnel error/i;
+const connectionLost =
+  /Connection terminated|Serve tunnel error|Failed to (?:dial|serve tunnel connection|accept incoming stream requests)/i;
 const registered = /Registered tunnel connection/i;
 
 export interface RegistrationWatch {
@@ -22,28 +25,38 @@ export interface RegistrationWatch {
   feed(text: string): void;
 }
 
-/**
- * Tracks consecutive registration errors from cloudflared output.
- *
- * cloudflared retries a lost registration forever instead of exiting, so process exit
- * alone cannot detect this failure. A transient reconnect prints the same error, so
- * several consecutive failures are required before the tunnel counts as lost.
- */
-export function createRegistrationWatch(confirmations: number): RegistrationWatch {
+// A cloudflared process owns several edge connections; one reconnect is not a tunnel loss.
+export function createRegistrationWatch(
+  confirmations: number,
+  recoveryMs = 20000,
+  now = () => performance.now(),
+): RegistrationWatch {
   let failures = 0;
   let reported = false;
+  let lostSince: number | undefined;
+  const healthy = new Set<string>();
   return {
     get failures() {
       return failures;
     },
     get reported() {
-      return reported;
+      return reported || (lostSince !== undefined && now() - lostSince >= recoveryMs);
     },
     feed(text: string) {
-      if (registered.test(text)) {
-        failures = 0;
-        reported = false;
-      } else if (registrationLost.test(text)) {
+      for (const line of text.split(/\r?\n/)) {
+        const connection = /\bconnIndex=(\d+)\b/.exec(line)?.[1] ?? '0';
+        if (registered.test(line)) {
+          healthy.add(connection);
+          failures = 0;
+          reported = false;
+          lostSince = undefined;
+          continue;
+        }
+        if (registrationFailed.test(line)) healthy.clear();
+        else if (connectionLost.test(line)) healthy.delete(connection);
+        else continue;
+        if (healthy.size) continue;
+        lostSince ??= now();
         failures += 1;
         if (failures >= confirmations) reported = true;
       }
@@ -57,24 +70,31 @@ function watchRegistration(
   confirmations: number,
   interval: number,
   onLost: (message: string) => void,
+  isReady: () => boolean,
 ): () => void {
   const watch = createRegistrationWatch(confirmations);
   let announced = false;
   const timer = setInterval(() => {
-    if (!watch.reported || announced) return;
+    if (!isReady() || !watch.reported || announced) return;
     announced = true;
     onLost('Tunnel registration was lost and is not recovering');
   }, interval);
   timer.unref();
   const onAbort = () => clearInterval(timer);
   signal?.addEventListener('abort', onAbort, { once: true });
-  const onData = (chunk: Buffer) => watch.feed(chunk.toString('utf8'));
-  child.stdout.on('data', onData);
-  child.stderr.on('data', onData);
+  const listeners = [child.stdout, child.stderr].map((stream) => {
+    let tail = '';
+    const onData = (chunk: Buffer) => {
+      const lines = (tail + chunk.toString('utf8')).split(/\r?\n/);
+      tail = lines.pop()!.slice(-16384);
+      for (const line of lines) watch.feed(line);
+    };
+    stream.on('data', onData);
+    return { stream, onData };
+  });
   return () => {
     clearInterval(timer);
-    child.stdout.off('data', onData);
-    child.stderr.off('data', onData);
+    for (const { stream, onData } of listeners) stream.off('data', onData);
     signal?.removeEventListener('abort', onAbort);
   };
 }
@@ -95,7 +115,7 @@ export async function startTunnel(
   const configFile = path.join(config.dataDir, 'cloudflared-empty.yml');
   await atomicWrite(
     configFile,
-    '# Managed by PC MCP; ignore unrelated user cloudflared configuration.\n',
+    '# Managed by PC MCP; ignore unrelated user cloudflared configuration.\nno-autoupdate: true\n',
   );
   const args = [
     'tunnel',
@@ -103,7 +123,9 @@ export async function startTunnel(
     configFile,
     '--no-autoupdate',
     '--protocol',
-    'http2',
+    config.tunnelProtocol,
+    '--edge-ip-version',
+    config.tunnelEdgeIpVersion,
     '--metrics',
     '127.0.0.1:0',
   ];
@@ -111,6 +133,7 @@ export async function startTunnel(
   else args.push('run');
   signal?.throwIfAborted();
   const child = spawn(config.cloudflaredBin, args, {
+    cwd: config.projectDir,
     stdio: 'pipe',
     windowsHide: true,
     detached: process.platform !== 'win32',
@@ -126,6 +149,13 @@ export async function startTunnel(
   let publicUrl = mode === 'named' ? config.publicUrl : '';
   let tail = '';
   let unwatch: (() => void) | undefined;
+  for (const stream of [child.stdout, child.stderr]) {
+    const output = redactedStream([config.tunnelToken], (message) => {
+      if (message.trim()) log({ event: 'cloudflared', message: message.trim() });
+    });
+    stream.on('data', (chunk: Buffer) => output.write(chunk));
+    stream.once('end', () => output.end());
+  }
 
   const stop = async () => {
     stopping = true;
@@ -133,6 +163,14 @@ export async function startTunnel(
     await terminateTree(child);
   };
   try {
+    unwatch = watchRegistration(
+      child,
+      signal,
+      watch.confirmations ?? 3,
+      watch.interval ?? 20000,
+      onExit,
+      () => ready && !stopping,
+    );
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(
         () =>
@@ -148,7 +186,6 @@ export async function startTunnel(
       signal?.addEventListener('abort', cancel, { once: true });
       const consume = (chunk: Buffer) => {
         const text = chunk.toString('utf8');
-        log({ event: 'cloudflared', message: text.trim() });
         tail = (tail + text).slice(-16384);
         publicUrl ||= /https:\/\/[a-z0-9-]+\.trycloudflare\.com/.exec(tail)?.[0] ?? '';
         registered ||= tail.includes('Registered tunnel connection');
@@ -156,15 +193,6 @@ export async function startTunnel(
           ready = true;
           clearTimeout(timeout);
           signal?.removeEventListener('abort', cancel);
-          unwatch = watchRegistration(
-            child,
-            signal,
-            watch.confirmations ?? 3,
-            watch.interval ?? 20000,
-            (message) => {
-              if (!stopping) onExit(message);
-            },
-          );
           resolve();
         }
       };

@@ -1,9 +1,8 @@
-param([int]$ProcessId, [ValidateSet('state', 'invoke', 'click', 'close')][string]$Action, [string]$Name)
+param([int]$ProcessId, [ValidateSet('state', 'invoke', 'post-click', 'close')][string]$Action, [string]$Name)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type @'
+Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 public static class DesktopWindow {
@@ -11,15 +10,21 @@ public static class DesktopWindow {
   [DllImport("user32.dll")] public static extern bool EnumWindows(Visitor visitor, IntPtr parameter);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
-  [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
-  [DllImport("user32.dll")] private static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
-  public static void Click(int x, int y, int restoreX, int restoreY) {
-    SetCursorPos(x, y);
-    System.Threading.Thread.Sleep(120);
-    mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero);
-    mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero);
-    System.Threading.Thread.Sleep(120);
-    SetCursorPos(restoreX, restoreY);
+  [StructLayout(LayoutKind.Sequential)] public struct Point { public int X; public int Y; }
+  [DllImport("user32.dll")] private static extern bool ScreenToClient(IntPtr window, ref Point point);
+  [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+  [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr window);
+  public static void PostClick(IntPtr window, uint expectedProcess, int x, int y) {
+    uint owner;
+    GetWindowThreadProcessId(window, out owner);
+    if (owner != expectedProcess || !IsWindowVisible(window)) throw new InvalidOperationException("Wrong native window");
+    var point = new Point { X = x, Y = y };
+    if (!ScreenToClient(window, ref point)) throw new InvalidOperationException("Cannot map native coordinates");
+    var position = new IntPtr(((point.Y & 0xffff) << 16) | (point.X & 0xffff));
+    SetForegroundWindow(window);
+    if (!PostMessage(window, 0x0200, IntPtr.Zero, position) ||
+        !PostMessage(window, 0x0201, new IntPtr(1), position) ||
+        !PostMessage(window, 0x0202, IntPtr.Zero, position)) throw new InvalidOperationException("Cannot post native click");
   }
 }
 '@
@@ -54,13 +59,15 @@ if ($Action -eq 'state') {
     @{ visible = $script:Visible; running = [bool](Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) } | ConvertTo-Json -Compress
 } elseif ($Action -eq 'close') {
     if (-not (Get-Process -Id $ProcessId).CloseMainWindow()) { throw 'No visible application window.' }
-} elseif ($Action -eq 'click') {
-    # Items that open a modal dialog block their click handler, so InvokePattern would never
-    # return. They are clicked with the mouse instead, at the reported element position.
-    $bounds = (Find-Control).Current.BoundingRectangle
-    if ($bounds.IsEmpty) { throw "Native control has no clickable bounds: $Name" }
-    $cursor = [System.Windows.Forms.Cursor]::Position
-    [DesktopWindow]::Click([int]($bounds.X + $bounds.Width / 2), [int]($bounds.Y + $bounds.Height / 2), $cursor.X, $cursor.Y)
+} elseif ($Action -eq 'post-click') {
+    # InvokePattern holds the WinForms provider while a modal menu handler runs. Post
+    # native input to its verified HWND instead; never move or click the global pointer.
+    $control = Find-Control
+    $bounds = $control.Current.BoundingRectangle
+    $window = $control
+    while ($window -and $window.Current.NativeWindowHandle -eq 0) { $window = [System.Windows.Automation.TreeWalker]::RawViewWalker.GetParent($window) }
+    if (-not $window -or $bounds.IsEmpty) { throw "No native window for $Name" }
+    [DesktopWindow]::PostClick([IntPtr]$window.Current.NativeWindowHandle, $ProcessId, [int]($bounds.X + $bounds.Width / 2), [int]($bounds.Y + $bounds.Height / 2))
 } else {
     (Find-Control).GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
 }

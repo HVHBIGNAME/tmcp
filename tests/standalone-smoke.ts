@@ -108,7 +108,7 @@ try {
   await connect();
   const installed = JSON.parse(await readFile(path.join(home, 'application.json'), 'utf8'));
   const state = await api('/state');
-  assert.equal(state.version, '2.0.0');
+  assert.equal(state.version, JSON.parse(await readFile('package.json', 'utf8')).version);
   assert(installed.node.startsWith(home));
   assert.match((await run(installed.node, ['--version'], { env: environment })).stdout, /v24\./);
   assert.equal(
@@ -196,11 +196,11 @@ try {
   registration = undefined;
   await page.locator('nav [data-view="settings"]').click();
   await page.getByRole('button', { name: 'Меню трея', exact: true }).click();
-  await native('click', 'Остановить сервер и выйти из TMCP…');
+  await native('post-click', 'Остановить сервер и выйти из TMCP…');
   await native('invoke', 'Отмена');
   assert.equal(child.exitCode, null);
   await page.getByRole('button', { name: 'Меню трея', exact: true }).click();
-  await native('click', 'Остановить сервер и выйти из TMCP…');
+  await native('post-click', 'Остановить сервер и выйти из TMCP…');
   await native('invoke', 'Остановить и выйти');
   await expect.poll(() => child?.exitCode, { timeout: 8000 }).toBe(0);
   await assert.rejects(fetch(`http://127.0.0.1:${mcpPort}/health`));

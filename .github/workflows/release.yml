@@ -62,14 +62,14 @@ jobs:
           $env:PSModulePath = "$PSHOME\Modules"
           npm run build:standalone
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Test standalone on the Windows desktop
+      - name: Test standalone runtime and installation
         shell: powershell
         env:
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
         run: |
           $env:PSModulePath = "$PSHOME\Modules"
-          npm run test:standalone
+          npm run test:standalone:headless
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@v4
         if: failure()
@@ -79,6 +79,7 @@ jobs:
           path: |
             ${{ runner.temp }}/tmcp single exe */installed home/.mcp-tunnel/*.log
             ${{ runner.temp }}/tmcp single exe */installed home/application.json
+            ${{ runner.temp }}/tmcp headless */home/.mcp-tunnel/*.log
       - uses: actions/upload-artifact@v4
         with:
           name: standalone

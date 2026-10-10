@@ -68,7 +68,7 @@ try {
     try {
       const nextAttempt = performance.now() + Math.min(30000, 2000 * Math.max(1, failures));
       while (performance.now() < nextAttempt && !(await stopRequested(config))) {
-        await delay(Math.min(500, nextAttempt - performance.now()), undefined, {
+        await delay(Math.max(1, Math.min(500, nextAttempt - performance.now())), undefined, {
           signal: abort.signal,
         });
       }

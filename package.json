@@ -1,6 +1,6 @@
 {
   "name": "pc-mcp-tunnel",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "private": true,
   "description": "Authenticated PC development tools over MCP and Cloudflare Tunnel",
   "type": "module",
@@ -24,6 +24,7 @@
     "test:a11y": "tsx scripts/audit-ui.ts",
     "test:desktop": "tsx tests/desktop-smoke.ts",
     "test:standalone": "tsx tests/standalone-smoke.ts",
+    "test:standalone:headless": "tsx tests/standalone-headless.ts",
     "test:lifecycle": "tsx scripts/check-lifecycle.ts --check",
     "start": "node dist/src/main.js",
     "tunnel": "node dist/src/main.js --tunnel quick",

@@ -177,16 +177,15 @@ try {
     'Minimized startup must not show a window',
   );
   assert.equal(await readFile(path.join(data, 'tokens.json'), 'utf8'), keysBefore);
-  const duplicate = spawn(startup.executable, ['--home', home], {
-    cwd: home,
-    env: environment,
-    stdio: 'ignore',
-  });
-  await new Promise<void>((resolve, reject) => {
-    duplicate.once('error', reject);
-    duplicate.once('exit', (code) =>
-      code === 0 ? resolve() : reject(new Error('Duplicate launch failed')),
-    );
+  await run(installed.node, [installed.cli, 'ui'], {
+    cwd: installed.project,
+    env: {
+      ...environment,
+      MCP_ENV_FILE: installed.envFile,
+      MCP_DATA_DIR: data,
+      MCP_DESKTOP_EXE: startup.executable,
+    },
+    timeout: 10000,
   });
   assert(
     JSON.parse((await native('state')).stdout).visible > 0,

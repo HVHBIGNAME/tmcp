@@ -322,7 +322,11 @@ try {
     else if (command === 'ui') {
       if (process.platform !== 'win32')
         throw new Error('Desktop GUI is available on Windows. Run tmcp for the terminal panel.');
-      const child = spawn(path.join(project, 'dist-ui', 'PcMcp.exe'), [], {
+      const executable = config.desktopExecutable ?? path.join(project, 'dist-ui', 'PcMcp.exe');
+      const args = config.desktopExecutable
+        ? ['--home', path.dirname(config.envFile), '--show']
+        : ['--show'];
+      const child = spawn(executable, args, {
         detached: true,
         stdio: 'ignore',
       });

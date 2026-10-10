@@ -8,6 +8,7 @@ param(
     [switch]$Autostart
 )
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 if (-not [Environment]::Is64BitOperatingSystem) { throw 'TMCP requires 64-bit Windows.' }
 if ($Version -notmatch '^(latest|v[0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9.-]+)?)$') { throw 'Invalid release tag.' }

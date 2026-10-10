@@ -15,7 +15,7 @@
 | `-Mode auto\|gui\|cli` | `auto`: GUI на desktop Windows, CLI на Windows Server |
 | `-InstallDir PATH`     | `%LOCALAPPDATA%\TMCP`                                 |
 | `-Root PATH`           | Домашняя папка пользователя                           |
-| `-Version v2.0.1`      | Последний опубликованный релиз                        |
+| `-Version v2.0.2`      | Последний опубликованный релиз                        |
 | `-NoStart`             | Не запускать сервер после установки                   |
 | `-Autostart`           | Явно включить автозапуск                              |
 
@@ -34,7 +34,7 @@ $install = [scriptblock]::Create((irm https://raw.githubusercontent.com/HVHBIGNA
 | ------------------ | -------------------------------------- |
 | `TMCP_HOME`        | Каталог приложения                     |
 | `TMCP_ROOT`        | Рабочая папка MCP при первой установке |
-| `TMCP_VERSION`     | Тег релиза, например `v2.0.1`          |
+| `TMCP_VERSION`     | Тег релиза, например `v2.0.2`          |
 | `TMCP_NO_START=1`  | Установить без запуска                 |
 | `TMCP_AUTOSTART=1` | Включить автозапуск явно               |
 

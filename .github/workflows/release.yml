@@ -56,7 +56,12 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm test
-      - run: npm run build:standalone
+      - name: Build with Windows PowerShell modules
+        shell: powershell
+        run: |
+          $env:PSModulePath = "$PSHOME\Modules"
+          npm run build:standalone
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - run: npm run test:standalone
       - uses: actions/upload-artifact@v4
         with:

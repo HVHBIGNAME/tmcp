@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { promisify } from 'node:util';
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
@@ -89,7 +90,7 @@ async function install(candidate: Buffer, version: string, failure = false, abor
     }),
   );
   if (abort) await writeFile(path.join(stage, 'abort'), 'abort');
-  const operation = run(
+  const operation = spawn(
     windowsPowerShell(),
     [
       '-NoProfile',
@@ -101,11 +102,14 @@ async function install(candidate: Buffer, version: string, failure = false, abor
       '-Manifest',
       manifest,
     ],
-    { env, timeout: 360000, windowsHide: true },
+    { env, signal: AbortSignal.timeout(360000), windowsHide: true, stdio: 'ignore' },
   );
-  if (failure)
-    await assert.rejects(operation, (error: unknown) => (error as { code: number }).code === 1);
-  else await operation;
+  try {
+    const [code] = await once(operation, 'exit');
+    assert.equal(code, failure ? 1 : 0, `Update installer failed; inspect ${stage}`);
+  } finally {
+    if (operation.exitCode === null) operation.kill();
+  }
   return stage;
 }
 try {

@@ -58,6 +58,7 @@ const clientKey: Options['keyGenerator'] = (req) => {
 };
 
 export async function createApp(config: Config, options: HttpOptions = {}) {
+  let maintenanceUntil = 0;
   const log =
     options.log ??
     ((event) => console.log(JSON.stringify({ time: new Date().toISOString(), ...event })));
@@ -455,6 +456,10 @@ export async function createApp(config: Config, options: HttpOptions = {}) {
       startedAt,
       log,
       autostart: options.autostart ?? autostartFor(config),
+      maintenance: () => Date.now() < maintenanceUntil,
+      setMaintenance: (enabled) => {
+        maintenanceUntil = enabled ? Date.now() + 60000 : 0;
+      },
       restartTunnel: options.restartTunnel ?? (async () => ({ url: config.publicUrl })),
       restartServer: options.restartServer ?? (() => undefined),
     }),
@@ -521,6 +526,16 @@ export async function createApp(config: Config, options: HttpOptions = {}) {
   app.use((req, res, next) => authRouter(req, res, next));
   app.use(
     '/mcp',
+    (_req, res, next) => {
+      if (Date.now() < maintenanceUntil) {
+        res.status(503).set('Retry-After', '15').json({
+          error: 'temporarily_unavailable',
+          message: 'TMCP is installing an update. Retry shortly.',
+        });
+        return;
+      }
+      next();
+    },
     (req, res, next) => {
       const span = traffic.begin(req.method);
       res.locals.traffic = span;

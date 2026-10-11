@@ -124,7 +124,8 @@ export async function stopService(config: Config): Promise<void> {
       method: 'POST',
       signal: AbortSignal.timeout(5000),
     }).catch(() => undefined);
-    if (response && !response.ok) throw new Error(`Stop failed: HTTP ${response.status}`);
+    if (response && !response.ok && response.status !== 503)
+      throw new Error(`Stop failed: HTTP ${response.status}`);
   }
   const deadline = performance.now() + 15000;
   while (performance.now() < deadline) {

@@ -92,6 +92,7 @@ export class Gateway {
   listServers() {
     return {
       mode: this.config.gatewayMode,
+      activeCalls: [...this.calls.values()].filter((call) => !call.finishedAt).length,
       sources: this.discovery.sources,
       diagnostics: this.discovery.diagnostics,
       servers: [...this.backends.values()].map((backend) => ({

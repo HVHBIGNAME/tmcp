@@ -5,9 +5,34 @@ import { promisify } from 'node:util';
 import { access, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fixture, httpFixture } from './helpers.js';
+import { listenControl } from '../src/ipc.js';
+import { stopService } from '../src/service-control.js';
 
 const exec = promisify(execFile);
 const cli = path.resolve('src/cli.ts');
+
+test('shutdown waits for the server to stop when IPC is already closing', async (t) => {
+  const { config } = await fixture(t);
+  let statuses = 0;
+  let shutdowns = 0;
+  const ipc = await listenControl(config.dataDir, (req, res) => {
+    if (req.url === '/_control/status' && ++statuses <= 2) {
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ service: 'pc-mcp-tunnel' }));
+    } else {
+      if (req.url === '/_control/shutdown') shutdowns++;
+      res.writeHead(503);
+      res.end();
+    }
+  });
+  try {
+    await stopService(config);
+    assert.equal(shutdowns, 1);
+    assert.equal(statuses, 3, 'A 503 must still wait for the service to disappear');
+  } finally {
+    await ipc.close();
+  }
+});
 
 test('CLI help runs without configuration and setup preserves existing keys', async (t) => {
   const { directory, root } = await fixture(t);

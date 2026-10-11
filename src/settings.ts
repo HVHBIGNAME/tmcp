@@ -13,6 +13,7 @@ export interface Settings {
   gateway: { discover: boolean; mode: 'catalog' | 'namespaced' };
   tunnel: { mode: 'quick' | 'named'; hostname: string; tunnelToken: string };
   ui: { theme: 'dark' | 'light'; locale: string; startMinimized: boolean };
+  updates: { enabled: boolean };
 }
 
 const settingsSchema = z.object({
@@ -37,6 +38,7 @@ const settingsSchema = z.object({
     locale: z.string(),
     startMinimized: z.boolean().default(false),
   }),
+  updates: z.object({ enabled: z.boolean() }).default({ enabled: true }),
 });
 
 const settingsPatchSchema = z
@@ -61,6 +63,7 @@ const settingsPatchSchema = z
     shell: settingsSchema.shape.shell.partial().optional(),
     gateway: settingsSchema.shape.gateway.partial().optional(),
     tunnel: settingsSchema.shape.tunnel.partial().optional(),
+    updates: z.object({ enabled: z.boolean().optional() }).optional(),
     ui: z
       .object({
         theme: z.enum(['dark', 'light']).optional(),
@@ -80,6 +83,7 @@ export const defaultSettings: Settings = {
   gateway: { discover: true, mode: 'catalog' },
   tunnel: { mode: 'quick', hostname: '', tunnelToken: '' },
   ui: { theme: 'dark', locale: 'ru', startMinimized: false },
+  updates: { enabled: true },
 };
 
 export interface RedactedSettings extends Settings {

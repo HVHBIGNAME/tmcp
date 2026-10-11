@@ -22,6 +22,7 @@ internal sealed class MainForm : Form
     private string? _pendingPage;
     private DateTime _lastStart = DateTime.MinValue;
     private Task? _startup;
+    private WindowsUpdates? _updates;
 
     public MainForm(bool background)
     {
@@ -60,6 +61,9 @@ internal sealed class MainForm : Form
         {
             var progress = new Progress<string>(text => { if (!_quitting && !IsDisposed) _message.Text = text; });
             await Program.Layout.PrepareAsync(progress, _closing.Token);
+            _updates ??= new WindowsUpdates(Program.Layout.Home, Program.Layout.Version,
+                Program.Layout.Bundled && !Program.Preview && Environment.GetEnvironmentVariable("TMCP_DISABLE_UPDATES") != "true",
+                PublishUpdateStatus, ApplyUpdateAsync);
             _prepared = true;
             if (!Program.Preview) { await Program.RunCliAsync("start", _closing.Token); _lastStart = DateTime.UtcNow; }
             _tray.SetBusy(false);
@@ -127,6 +131,11 @@ internal sealed class MainForm : Form
         if (!_pageLoaded && !_navigating) { _navigating = true; _web.Source = Program.UiUri; }
         else if (!_online) _web.CoreWebView2.PostWebMessageAsJson("{\"type\":\"server-ready\"}");
         _online = true;
+        if (_updates != null && _pageLoaded && state is { } current)
+        {
+            PublishUpdateStatus(_updates.State);
+            await _updates.TickAsync(current.GetProperty("settings").GetProperty("updates").GetProperty("enabled").GetBoolean());
+        }
     }
 
     private async Task BuildWebViewAsync()
@@ -137,7 +146,9 @@ internal sealed class MainForm : Form
             _bridge?.Dispose(); _web?.Dispose();
             _web = new WebView2 { Dock = DockStyle.Fill, DefaultBackgroundColor = BackColor };
             Controls.Add(_web); _waiting.BringToFront();
-            var environment = await CoreWebView2Environment.CreateAsync(Program.Layout.Browser, Path.Combine(Program.DataDir, "browser"));
+            var browserData = Program.Layout.Payload is { } payload
+                ? Path.Combine(Program.DataDir, "browser", payload.Webview) : Path.Combine(Program.DataDir, "browser");
+            var environment = await CoreWebView2Environment.CreateAsync(Program.Layout.Browser, browserData);
             await _web.EnsureCoreWebView2Async(environment);
             var core = _web.CoreWebView2;
             core.SetVirtualHostNameToFolderMapping(Program.UiUri.Host, Path.Combine(Program.ProjectDir, "ui", "public"), CoreWebView2HostResourceAccessKind.DenyCors);
@@ -154,7 +165,7 @@ internal sealed class MainForm : Form
             _web.NavigationCompleted += (_, e) =>
             {
                 _navigating = false; _pageLoaded = e.IsSuccess;
-                if (_pageLoaded) { _waiting.Visible = false; _web.BringToFront(); if (_pendingPage != null) SendPage(_pendingPage); }
+                if (_pageLoaded) { _waiting.Visible = false; _web.BringToFront(); if (_pendingPage != null) SendPage(_pendingPage); if (_updates != null) PublishUpdateStatus(_updates.State); }
                 else ShowIssue("Панель пока недоступна. Повторяем подключение…");
             };
         }
@@ -170,8 +181,11 @@ internal sealed class MainForm : Form
             using var message = JsonDocument.Parse(e.WebMessageAsJson);
             if (!message.RootElement.TryGetProperty("type", out var type)) return;
             if (type.GetString() == "theme" && message.RootElement.TryGetProperty("theme", out var theme)) SetTheme(theme.GetString() != "light");
+            else if (type.GetString() == "ui-ready" && Program.MarkUpdateReady()) _tray.Notify("TMCP обновлён", $"Версия {Program.Layout.Version} установлена автоматически.");
             else if (type.GetString() == "quit") await QuitAsync();
             else if (type.GetString() == "tray-menu") _tray.ShowMenu(PointToScreen(new Point(Width - 360, Height - 100)));
+            else if (type.GetString() == "check-updates" && _updates != null) await _updates.CheckAsync(true);
+            else if (type.GetString() == "update-status" && _updates != null) PublishUpdateStatus(_updates.State);
             else if (_bridge != null) await _bridge.HandleAsync(message.RootElement);
         }
         catch (Exception error) when (error is JsonException or InvalidOperationException or KeyNotFoundException) { Program.Log(error); }
@@ -182,6 +196,61 @@ internal sealed class MainForm : Form
         var value = dark ? 1 : 0; Native.DwmSetWindowAttribute(Handle, 20, ref value, sizeof(int));
         BackColor = dark ? Color.FromArgb(16, 20, 25) : Color.FromArgb(243, 245, 247);
         _tray.SetTheme(dark);
+    }
+
+    private void PublishUpdateStatus(UpdateStatus status)
+    {
+        if (_quitting || IsDisposed) return;
+        _web?.CoreWebView2?.PostWebMessageAsJson(JsonSerializer.Serialize(new { type = "update-status", update = status },
+            new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase }));
+    }
+
+    private async Task<bool> UpdateIdleAsync()
+    {
+        if (_web?.CoreWebView2 == null || !_pageLoaded || OwnedForms.Any(form => form.Visible)) return false;
+        var state = await ApiAsync("/state");
+        if (state.GetProperty("jobs").EnumerateArray().Any(job => job.GetProperty("status").GetString() == "running") ||
+            state.GetProperty("approvals").GetArrayLength() != 0 ||
+            state.GetProperty("traffic").GetProperty("stats").GetProperty("active").GetInt32() != 0 ||
+            state.GetProperty("gateway").GetProperty("activeCalls").GetInt32() != 0) return false;
+        return await _web.ExecuteScriptAsync("typeof window.tmcpCanUpdate === 'function' && window.tmcpCanUpdate()") == "true";
+    }
+
+    private async Task<bool> ApplyUpdateAsync(UpdatePlan plan)
+    {
+        if (_quitting || _stopping || !await UpdateIdleAsync()) return false;
+        _stopping = true;
+        string? abort = null;
+        Process? installer = null;
+        try
+        {
+            await ApiAsync("/maintenance", new { enabled = true }, "PATCH");
+            if (!await UpdateIdleAsync()) { await ApiAsync("/maintenance", new { enabled = false }, "PATCH"); return false; }
+            _heading.Text = "Обновляем TMCP";
+            _message.Text = "Проверенный EXE будет установлен автоматически. Настройки и ключи сохранятся.";
+            _waiting.Visible = true; _waiting.BringToFront();
+            _tray.SetBusy(true, "устанавливаем обновление…");
+            (installer, abort) = await WindowsUpdates.StartInstallerAsync(plan, Visible, _closing.Token);
+            await Program.RunCliAsync("stop");
+            _quitting = true; Close();
+            return true;
+        }
+        catch
+        {
+            if (abort != null) await File.WriteAllTextAsync(abort, "abort");
+            if (installer != null && !installer.HasExited)
+            {
+                using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                try { await installer.WaitForExitAsync(deadline.Token); }
+                catch (OperationCanceledException) { if (!installer.HasExited) installer.Kill(); }
+            }
+            try { await ApiAsync("/maintenance", new { enabled = false }, "PATCH"); }
+            catch (Exception error) { Program.Log(error); }
+            await Program.RunCliAsync("start");
+            _waiting.Visible = false;
+            throw;
+        }
+        finally { installer?.Dispose(); if (!_quitting) { _stopping = false; _tray.SetBusy(false); } }
     }
     private void ShowWindow() { Show(); ShowInTaskbar = true; WindowState = FormWindowState.Normal; Activate(); Native.SetForegroundWindow(Handle); }
     private void Navigate(string page) { ShowWindow(); if (page.Length != 0) { _pendingPage = page; if (_pageLoaded) SendPage(page); } }
@@ -276,7 +345,7 @@ internal sealed class MainForm : Form
     protected override void Dispose(bool disposing)
     {
         if (disposing && !_disposed)
-        { _disposed = true; _closing.Cancel(); _bridge?.Dispose(); _web?.Dispose(); _tray.Dispose(); _http.Dispose(); _closing.Dispose(); }
+        { _disposed = true; _closing.Cancel(); _updates?.Dispose(); _bridge?.Dispose(); _web?.Dispose(); _tray.Dispose(); _http.Dispose(); _closing.Dispose(); }
         base.Dispose(disposing);
     }
 }

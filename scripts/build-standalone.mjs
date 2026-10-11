@@ -9,7 +9,20 @@ import path from 'node:path';
 
 if (process.platform !== 'win32' || process.arch !== 'x64')
   throw new Error('Build the standalone EXE on Windows x64.');
-const run = promisify(execFile);
+const exec = promisify(execFile);
+async function run(file, args, options) {
+  const label = `${path.basename(file)} ${args[0] ?? ''}`;
+  const started = performance.now();
+  process.stdout.write(`Building: ${label}\n`);
+  const operation = exec(file, args, options);
+  if (file === 'dotnet') {
+    operation.child.stdout.on('data', (chunk) => process.stdout.write(chunk));
+    operation.child.stderr.on('data', (chunk) => process.stderr.write(chunk));
+  }
+  const result = await operation;
+  process.stdout.write(`Built ${label} in ${Math.round((performance.now() - started) / 1000)}s\n`);
+  return result;
+}
 const root = process.cwd();
 const work = path.resolve('.mcp-tunnel', 'standalone-build');
 const cache = path.resolve(process.env.TMCP_BUILD_CACHE ?? '.mcp-tunnel/build-cache');
@@ -154,11 +167,13 @@ await writeFile(
     webview: manifest.webview.version,
   }),
 );
-const published = await run(
+await run(
   'dotnet',
   [
     'publish',
     'ui/PcMcp.csproj',
+    '--disable-build-servers',
+    '-p:UseSharedCompilation=false',
     '-c',
     'Release',
     '-r',
@@ -174,7 +189,6 @@ const published = await run(
   ],
   { cwd: root, maxBuffer: 8 * 1024 * 1024 },
 );
-process.stdout.write(published.stdout);
 // NuGet may copy IntelliSense documentation independently of the SDK publish flags.
 for (const name of ['Microsoft.Web.WebView2.Core.xml', 'Microsoft.Web.WebView2.WinForms.xml'])
   await rm(path.join(output, name), { force: true });

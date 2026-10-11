@@ -35,6 +35,7 @@ Object.assign(environment, {
   PATH: path.join(process.env.SystemRoot!, 'System32'),
   MCP_PORT: String(mcpPort),
   MCP_LOCAL_ONLY: 'true',
+  TMCP_DISABLE_UPDATES: 'true',
   MCP_GATEWAY_DISCOVER: 'false',
   MCP_ENABLE_SCREENSHOTS: 'false',
   WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${debugPort}`,
@@ -42,7 +43,7 @@ Object.assign(environment, {
 let child: ChildProcess | undefined, browser: Browser | undefined;
 let page!: Page;
 async function connect() {
-  for (let i = 0; i < 180; i++) {
+  for (let i = 0; i < 600; i++) {
     if (child?.exitCode !== null) throw new Error(`Standalone exited: ${child?.exitCode}`);
     try {
       browser = await chromium.connectOverCDP(`http://127.0.0.1:${debugPort}`, { timeout: 1000 });
@@ -109,6 +110,20 @@ try {
   const installed = JSON.parse(await readFile(path.join(home, 'application.json'), 'utf8'));
   const state = await api('/state');
   assert.equal(state.version, JSON.parse(await readFile('package.json', 'utf8')).version);
+  await assert.rejects(
+    run(executable, ['--prepare-only', '--home', home], {
+      cwd: download,
+      env: environment,
+      timeout: 10000,
+    }),
+    (error: unknown) => {
+      const result = error as { code?: number; killed?: boolean; stderr?: string };
+      assert.equal(result.code, 1);
+      assert(!result.killed);
+      assert.match(result.stderr ?? '', /Another TMCP/);
+      return true;
+    },
+  );
   assert(installed.node.startsWith(home));
   assert.match((await run(installed.node, ['--version'], { env: environment })).stdout, /v24\./);
   assert.equal(

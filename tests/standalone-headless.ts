@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { cp, mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -89,13 +89,57 @@ async function call(key: string) {
 }
 try {
   assert.deepEqual(await readdir(download), ['TMCP.exe']);
+  for (const [args, message] of [
+    [['--prepare-only', '--home'], /requires a directory/],
+    [['--headless', '--unknown', '--home', home], /Unknown desktop option/],
+    [['--headless', '--prepare-only', '--home', home], /cannot be combined/],
+    [['--headless', '--show', '--home', home], /service command/],
+    [['--prepare-only', '--home', home, '--home', home], /Repeated option/],
+  ] as const) {
+    await assert.rejects(
+      run(executable, [...args], { cwd: download, env, timeout: 10000 }),
+      (error: unknown) => {
+        const result = error as { code?: number; killed?: boolean; stderr?: string };
+        assert.equal(result.code, 1);
+        assert(!result.killed, 'Invalid service arguments must exit, not show a dialog');
+        assert.match(result.stderr ?? '', message);
+        return true;
+      },
+    );
+  }
+  await assert.rejects(stat(home), { code: 'ENOENT' });
+  await mkdir(data, { recursive: true });
+  const settingsFile = path.join(data, 'settings.json');
+  await writeFile(settingsFile, '{broken');
   await run(executable, ['--prepare-only', '--home', home], {
     cwd: download,
     env,
-    timeout: 120000,
+    timeout: 300000,
   });
   installed = JSON.parse(await readFile(path.join(home, 'application.json'), 'utf8'));
   assert(installed && installed.node.startsWith(home));
+  assert.equal(
+    await readFile(settingsFile, 'utf8'),
+    '{broken',
+    'Preparation must preserve existing settings',
+  );
+  await assert.rejects(
+    run(executable, ['--headless', '--local', '--home', home], {
+      cwd: download,
+      env,
+      timeout: 60000,
+    }),
+    (error: unknown) => {
+      const result = error as { code?: number; killed?: boolean; stderr?: string };
+      assert.equal(result.code, 1);
+      assert(!result.killed, 'Failed headless startup must report failure instead of hanging');
+      assert.match(result.stderr ?? '', /TMCP:/);
+      return true;
+    },
+  );
+  assert.equal(await readFile(settingsFile, 'utf8'), '{broken');
+  await stop();
+  await rm(settingsFile);
   assert.match((await run(installed.node, ['--version'], { env })).stdout, /v24\./);
   await run(
     installed.node,
@@ -110,7 +154,7 @@ try {
   await run(executable, ['--headless', '--local', '--home', home], {
     cwd: download,
     env,
-    timeout: 30000,
+    timeout: 60000,
   });
   const state = await ready();
   assert.equal(state.version, JSON.parse(await readFile('package.json', 'utf8')).version);
@@ -138,7 +182,7 @@ try {
   await run(startup.executable, ['--autostart', '--headless', '--local', '--home', home], {
     cwd: home,
     env,
-    timeout: 30000,
+    timeout: 60000,
   });
   await ready();
   assert.equal(await readFile(path.join(data, 'tokens.json'), 'utf8'), keys);

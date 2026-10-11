@@ -24,33 +24,43 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
-        ApplicationConfiguration.Initialize();
-        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
-        _ = CultureInfo.GetCultureInfo(1049);
-        bool background;
+        var serviceOnly = args.Contains("--headless") || args.Contains("--prepare-only");
         try
         {
-            Layout = new AppLayout(args, Preview);
-            background = args.Contains("--background") || (!args.Contains("--show") && Layout.StartMinimized());
+            Run(LaunchOptions.Parse(args));
         }
         catch (Exception error)
         {
-            MessageBox.Show(error.Message, "TMCP: не удалось запустить приложение", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            Environment.ExitCode = 1; return;
+            if (serviceOnly) Console.Error.WriteLine($"TMCP: {error.Message}");
+            else MessageBox.Show(error.Message, "TMCP: не удалось запустить приложение", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            Log(error);
+            Environment.ExitCode = 1;
         }
-        LocalOnly = args.Contains("--local") || Environment.GetEnvironmentVariable("MCP_LOCAL_ONLY") == "true";
-        Headless = args.Contains("--headless");
+    }
+
+    private static void Run(LaunchOptions options)
+    {
+        ApplicationConfiguration.Initialize();
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+        _ = CultureInfo.GetCultureInfo(1049);
+        Layout = new AppLayout(options.Home, Preview);
+        if (ForwardToInstalled(options)) return;
+        Headless = options.Headless;
+        LocalOnly = options.Local || Environment.GetEnvironmentVariable("MCP_LOCAL_ONLY") == "true";
+        var background = !options.ServiceOnly && (options.Background || (!options.Show && Layout.StartMinimized()));
         ShowMessage = Native.RegisterWindowMessage("TMCP.Show." + Instance);
         using var single = new Mutex(true, @"Local\TmcpDesktop-" + Instance, out var first);
-        if (!first) { if (!Headless && !args.Contains("--autostart") && !args.Contains("--prepare-only")) Native.PostMessage(new IntPtr(0xffff), ShowMessage, IntPtr.Zero, IntPtr.Zero); return; }
-        if (args.Contains("--prepare-only") || Headless)
+        if (!first)
         {
-            try
-            {
-                Layout.PrepareAsync(new Progress<string>(), CancellationToken.None).GetAwaiter().GetResult();
-                if (Headless) RunCliAsync("start").GetAwaiter().GetResult();
-            }
-            catch (Exception error) { Log(error); Environment.ExitCode = 1; }
+            if (options.ServiceOnly) throw new InvalidOperationException("Another TMCP desktop or setup operation is using this home. Close it and retry.");
+            if (!options.Autostart) Native.PostMessage(new IntPtr(0xffff), ShowMessage, IntPtr.Zero, IntPtr.Zero);
+            return;
+        }
+        if (options.ServiceOnly)
+        {
+            Layout.PrepareAsync(new Progress<string>(), CancellationToken.None).GetAwaiter().GetResult();
+            if (Headless) RunCliAsync("start").GetAwaiter().GetResult();
+            if (Headless) MarkUpdateReady();
             return;
         }
         using var window = new MainForm(background);
@@ -67,6 +77,37 @@ internal static class Program
         uri.Scheme == UiUri.Scheme && uri.Authority == UiUri.Authority && uri.UserInfo.Length == 0 &&
         uri.AbsolutePath is "/" or "/index.html";
 
+    private static bool ForwardToInstalled(LaunchOptions options)
+    {
+        if (!Layout.Bundled || options.PrepareOnly || !File.Exists(Layout.Executable) || string.Equals(Layout.Executable, Environment.ProcessPath, StringComparison.OrdinalIgnoreCase)) return false;
+        var info = FileVersionInfo.GetVersionInfo(Layout.Executable);
+        if (info.ProductName != "TMCP Desktop" || !Version.TryParse(info.FileVersion, out var installed)) return false;
+        var current = UpdateClient.ParseVersion(Layout.Version);
+        if (new Version(installed.Major, installed.Minor, installed.Build) <= current) return false;
+        var start = new ProcessStartInfo(Layout.Executable) { UseShellExecute = false, WorkingDirectory = Layout.Home };
+        start.ArgumentList.Add("--home"); start.ArgumentList.Add(Layout.Home);
+        foreach (var flag in new[] { options.Background ? "--background" : null, options.Show ? "--show" : null, options.Local ? "--local" : null,
+            options.Headless ? "--headless" : null, options.Autostart ? "--autostart" : null }) if (flag != null) start.ArgumentList.Add(flag);
+        using var process = Process.Start(start) ?? throw new IOException("Cannot launch the updated application.");
+        if (options.Headless)
+        {
+            if (!process.WaitForExit(300000)) throw new TimeoutException("The updated application did not finish starting.");
+            if (process.ExitCode != 0) throw new IOException($"The updated application failed (exit {process.ExitCode}).");
+        }
+        return true;
+    }
+
+    internal static bool MarkUpdateReady()
+    {
+        var filename = Environment.GetEnvironmentVariable("TMCP_UPDATE_READY_FILE");
+        if (string.IsNullOrEmpty(filename)) return false;
+        var prefix = Path.GetFullPath(Path.Combine(Layout.Home, ".updates")) + Path.DirectorySeparatorChar;
+        if (!Path.GetFullPath(filename).StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) throw new IOException("Invalid update readiness path.");
+        File.WriteAllText(filename, System.Text.Json.JsonSerializer.Serialize(new { version = Layout.Version, pid = Environment.ProcessId }));
+        Environment.SetEnvironmentVariable("TMCP_UPDATE_READY_FILE", null);
+        return true;
+    }
+
     private static Icon LoadIcon()
     {
         using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("PcMcp.app.ico")
@@ -77,9 +118,11 @@ internal static class Program
 
     internal static void Log(Exception? error)
     {
+        if (Layout is null) { Debug.WriteLine(error); return; }
         try { Directory.CreateDirectory(DataDir); File.AppendAllText(Path.Combine(DataDir, "ui-error.log"), $"{DateTime.UtcNow:O} {error}\n"); }
         catch (IOException) { Debug.WriteLine(error); }
         catch (UnauthorizedAccessException) { Debug.WriteLine(error); }
+        catch (ArgumentException) { Debug.WriteLine(error); }
     }
 
     internal static async Task RunCliAsync(string command, CancellationToken cancellation = default)
@@ -97,13 +140,13 @@ internal static class Program
         { WorkingDirectory = ProjectDir, UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true, RedirectStandardOutput = true };
         info.ArgumentList.Add(Path.Combine(ProjectDir, "dist", "src", "cli.js"));
         info.ArgumentList.Add(command);
-        if (command == "start") info.ArgumentList.Add("--no-wait");
+        if (command == "start" && !Headless) info.ArgumentList.Add("--no-wait");
         info.Environment["MCP_ENV_FILE"] = Layout.EnvFile;
         info.Environment["MCP_DATA_DIR"] = DataDir;
         info.Environment["MCP_LOCAL_ONLY"] = LocalOnly ? "true" : "false";
         if (Layout.Bundled)
         {
-            info.Environment["MCP_DESKTOP_EXE"] = Environment.ProcessPath!;
+            info.Environment["MCP_DESKTOP_EXE"] = Layout.Executable;
             info.Environment["MCP_DESKTOP_MODE"] = Headless ? "cli" : "gui";
             info.Environment["CLOUDFLARED_BIN"] = Path.Combine(ProjectDir, "bin", "cloudflared.exe");
         }

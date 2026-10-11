@@ -8,7 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>PcMcp</AssemblyName>
     <RootNamespace>PcMcp</RootNamespace>
-    <Version>2.0.2</Version>
+    <Version>2.1.0</Version>
     <Product>TMCP Desktop</Product>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>app.ico</ApplicationIcon>
@@ -40,6 +40,7 @@
 
   <ItemGroup>
     <EmbeddedResource Include="app.ico" LogicalName="PcMcp.app.ico" />
+    <EmbeddedResource Include="update-install.ps1" LogicalName="PcMcp.update-install.ps1" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(PayloadArchive)' != ''">

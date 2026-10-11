@@ -3,6 +3,8 @@ dist
 dist-ui
 ui/bin
 ui/obj
+tests/UpdateClientTests/bin
+tests/UpdateClientTests/obj
 test-results
 playwright-report
 release

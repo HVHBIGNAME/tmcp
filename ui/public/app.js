@@ -55,6 +55,12 @@ const outcomeLabels = {
 };
 
 export function createControlApp() {
+  let updateInfo = {
+    supported: false,
+    status: 'idle',
+    message: 'Ожидаем сведения об обновлениях…',
+    progress: 0,
+  };
   const client = new ControlClient();
   const state = { data: null, online: false, view: 'overview', logAuto: true, lastUrl: null };
   const root = document.getElementById('root');
@@ -229,6 +235,7 @@ export function createControlApp() {
     if (url) state.lastUrl = url;
     if (!currentPage) mountPage();
     else currentPage.update?.(data);
+    window.chrome?.webview?.postMessage({ type: 'ui-ready' });
   }
 
   function disconnected(error) {
@@ -1223,6 +1230,42 @@ export function createControlApp() {
         }
       },
     );
+    let savingUpdates = false;
+    const updateMessage = el('p', { className: 'muted', role: 'status' });
+    const updateVersion = el('p', { className: 'muted' });
+    const checkUpdates = button('Проверить и обновить', 'refresh', () =>
+      window.chrome?.webview?.postMessage({ type: 'check-updates' }),
+    );
+    const automaticUpdates = toggle(
+      'Обновлять автоматически',
+      'Проверять GitHub, загружать проверенный EXE и перезапускаться после завершения команд и редактирования. Ключи и настройки сохраняются.',
+      settings.updates.enabled,
+      async (event) => {
+        const enabled = event.target.checked;
+        savingUpdates = true;
+        automaticUpdates.setAttribute('aria-busy', 'true');
+        event.target.disabled = true;
+        try {
+          await save({ updates: { enabled } });
+        } catch (error) {
+          event.target.checked = !enabled;
+          toast(error.message, 'error');
+        } finally {
+          savingUpdates = false;
+          automaticUpdates.removeAttribute('aria-busy');
+          event.target.disabled = !updateInfo.supported;
+        }
+      },
+    );
+    const drawUpdates = () => {
+      updateMessage.textContent = updateInfo.message;
+      updateVersion.textContent = `Текущая версия: ${updateInfo.currentVersion ?? data.version}${updateInfo.availableVersion ? ` · Доступна: ${updateInfo.availableVersion}` : ''}`;
+      checkUpdates.disabled =
+        !updateInfo.supported ||
+        ['checking', 'downloading', 'installing'].includes(updateInfo.status);
+      if (!savingUpdates) automaticUpdates.querySelector('input').disabled = !updateInfo.supported;
+    };
+    drawUpdates();
     const general = formPanel(
       'Возможности компьютера',
       'Разрешения каждого токена дополнительно ограничивают доступ.',
@@ -1386,7 +1429,7 @@ export function createControlApp() {
         theme,
         panel(
           'Автозагрузка и трей',
-          'При включении автозагрузки самостоятельный EXE устанавливается в постоянное место.',
+          'Используется постоянная рабочая копия EXE. Запуск при входе включается по вашему выбору.',
           el('div', {}, [startupHost, minimized]),
         ),
         panel(
@@ -1414,11 +1457,19 @@ export function createControlApp() {
               : null,
           ]),
         ),
+        panel(
+          'Обновления из GitHub',
+          'Автоматическая проверка каждые 6 часов. При неудачном запуске новая версия откатывается.',
+          el('div', {}, [automaticUpdates, updateVersion, updateMessage, checkUpdates]),
+        ),
       ]),
       update(next) {
         if (!savingMinimized)
           minimized.querySelector('input').checked = next.settings.ui.startMinimized;
+        if (!savingUpdates)
+          automaticUpdates.querySelector('input').checked = next.settings.updates.enabled;
       },
+      updateStatus: drawUpdates,
     };
   }
 
@@ -1440,11 +1491,22 @@ export function createControlApp() {
     const message = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
     if (message?.type === 'server-ready') void poller.refresh();
     if (message?.type === 'navigate' && Object.hasOwn(pages, message.page)) navigate(message.page);
+    if (message?.type === 'update-status' && message.update) {
+      updateInfo = message.update;
+      currentPage?.updateStatus?.();
+    }
   };
   window.chrome?.webview?.addEventListener('message', hostMessage);
+  window.chrome?.webview?.postMessage({ type: 'update-status' });
   void poller.refresh();
   return {
     refresh: () => poller.refresh(),
+    canUpdate: () =>
+      state.online &&
+      !disposed &&
+      !document.querySelector(
+        '[data-dirty="true"], dialog[open], [role="dialog"], [aria-busy="true"]',
+      ),
     dispose() {
       disposed = true;
       currentPage?.dispose?.();
@@ -1459,5 +1521,6 @@ export function createControlApp() {
 
 if (typeof document !== 'undefined' && document.getElementById('root')) {
   const app = createControlApp();
+  window.tmcpCanUpdate = app.canUpdate;
   window.addEventListener('pagehide', () => app.dispose(), { once: true });
 }

@@ -255,6 +255,45 @@ test('settings apply explicitly, preserve secrets, theme and autostart controls 
   await expect(page.getByText('Автозапуск включён', { exact: true })).toBeVisible();
 });
 
+test('automatic update preference persists and unsaved forms block installation', async ({
+  page,
+  server,
+}) => {
+  await page.goto(server.url);
+  await page.locator('nav [data-view="settings"]').click();
+  await expect(page.getByRole('checkbox', { name: 'Обновлять автоматически' })).toBeVisible();
+  await page.evaluate(() =>
+    window.dispatchEvent(
+      new CustomEvent('tmcp-fixture-message', {
+        detail: {
+          type: 'update-status',
+          update: {
+            supported: true,
+            currentVersion: '2.1.0',
+            status: 'current',
+            message: 'Актуальная версия',
+            progress: 0,
+          },
+        },
+      }),
+    ),
+  );
+  await page.getByRole('checkbox', { name: 'Обновлять автоматически' }).uncheck();
+  await expect.poll(() => server.service.settings.get().updates.enabled).toBe(false);
+  await expect.poll(() => page.evaluate('window.tmcpCanUpdate()')).toBe(true);
+  await page.getByRole('checkbox', { name: 'Запуск команд', exact: true }).uncheck();
+  await expect.poll(() => page.evaluate('window.tmcpCanUpdate()')).toBe(false);
+  await page.reload();
+  await page.locator('nav [data-view="settings"]').click();
+  await expect(page.getByRole('checkbox', { name: 'Обновлять автоматически' })).not.toBeChecked();
+  await expect.poll(() => page.evaluate('window.tmcpCanUpdate()')).toBe(true);
+  await page.locator('nav [data-view="tokens"]').click();
+  await page.getByRole('button', { name: 'Новый токен' }).click();
+  await expect.poll(() => page.evaluate('window.tmcpCanUpdate()')).toBe(false);
+  await page.getByRole('button', { name: 'Отмена', exact: true }).click();
+  await expect.poll(() => page.evaluate('window.tmcpCanUpdate()')).toBe(true);
+});
+
 test('all pages fit desktop and narrow layouts without browser errors', async ({
   page,
   server,

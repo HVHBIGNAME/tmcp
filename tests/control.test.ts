@@ -51,6 +51,7 @@ test('partial settings writes are serialized and corrupt saved settings are neve
   await settings.load();
   await settings.update({ telegram: { token: 'private-token', allowedChats: ['42'] } });
   await settings.update({ ui: { startMinimized: true } });
+  await settings.update({ updates: { enabled: false } });
   await Promise.all([
     settings.update({ ui: { theme: 'light' } }),
     settings.update({ shell: { enabled: false } }),
@@ -61,6 +62,7 @@ test('partial settings writes are serialized and corrupt saved settings are neve
   assert.equal(settings.get().shell.enabled, false);
   assert.equal(settings.get().ui.locale, 'ru');
   assert.equal(settings.get().ui.startMinimized, true);
+  assert.equal(settings.get().updates.enabled, false);
   const reopened = new SettingsStore(filename);
   await reopened.load();
   assert.deepEqual(reopened.get(), settings.get());
@@ -82,4 +84,22 @@ test('autostart definitions quote executable paths and escape platform syntax', 
   const mac = startupDefinition('darwin', '/Users/test/A&B', '/opt/node', '/Users/test/data');
   assert.match(mac, /A&amp;B/);
   assert(!mac.includes('<string>/Users/test/A&B'));
+});
+
+test('update maintenance pauses new MCP requests and can be resumed', async (t) => {
+  const ui = await createUiFixture();
+  t.after(() => ui.close());
+  const enabled = await ui.control('/_control/api/maintenance', {
+    method: 'PATCH',
+    body: JSON.stringify({ enabled: true }),
+  });
+  assert.equal(enabled.status, 200);
+  const response = await fetch(`${ui.publicUrl}/mcp`, { method: 'POST' });
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get('retry-after'), '15');
+  await ui.control('/_control/api/maintenance', {
+    method: 'PATCH',
+    body: JSON.stringify({ enabled: false }),
+  });
+  assert.equal((await fetch(`${ui.publicUrl}/mcp`, { method: 'POST' })).status, 401);
 });

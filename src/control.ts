@@ -30,6 +30,8 @@ export interface ControlServices {
   capabilities: { shell: boolean; screenshots: boolean };
   log: Logger;
   autostart: AutostartControl;
+  maintenance: () => boolean;
+  setMaintenance: (enabled: boolean) => void;
   startedAt: string;
   restartTunnel: (mode: 'quick' | 'named') => Promise<{ url: string }>;
   restartServer: () => void;
@@ -47,6 +49,7 @@ export function controlRouter(services: ControlServices): Router {
     const gateway = services.gateway.listServers();
     res.json({
       version,
+      maintenance: services.maintenance(),
       publicUrl: services.publicUrl(),
       connection: services.connection(),
       capabilities: services.capabilities,
@@ -92,6 +95,12 @@ export function controlRouter(services: ControlServices): Router {
       clearInterval(heartbeat);
       unsubscribe();
     });
+  });
+
+  router.patch('/maintenance', (req, res) => {
+    const { enabled } = z.object({ enabled: z.boolean() }).parse(req.body);
+    services.setMaintenance(enabled);
+    res.json({ maintenance: services.maintenance() });
   });
 
   router.get('/audit', (req, res) => {

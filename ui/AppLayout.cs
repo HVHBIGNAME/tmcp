@@ -14,13 +14,14 @@ internal sealed class AppLayout
     internal string Home { get; }
     internal string Project { get; }
     internal string EnvFile => Path.Combine(Home, ".env");
+    internal string Executable => Bundled ? Path.Combine(Home, "TMCP.exe") : Environment.ProcessPath!;
     internal string Data => Path.GetFullPath(Environment.GetEnvironmentVariable("PC_MCP_UI_DATA_DIR") ?? ReadVariable("MCP_DATA_DIR") ?? ".mcp-tunnel", Home);
     internal PayloadInfo? Payload { get; }
     internal bool Bundled => Payload != null;
     internal string? Browser => Bundled ? Path.Combine(Project, "browser-runtime") : null;
     internal string Version => Payload?.Version ?? Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "2.0.0";
 
-    internal AppLayout(string[] args, bool preview)
+    internal AppLayout(string? requestedHome, bool preview)
     {
         var assembly = Assembly.GetExecutingAssembly();
         using var stream = preview ? null : assembly.GetManifestResourceStream("PcMcp.Payload.json");
@@ -31,10 +32,8 @@ internal sealed class AppLayout
             if (Payload.Sha256.Length != 64 || Payload.Sha256.Any(c => !Uri.IsHexDigit(c)))
                 throw new InvalidDataException("Invalid embedded runtime digest.");
         }
-        var requested = Array.IndexOf(args, "--home");
-        if (requested >= 0 && requested + 1 >= args.Length) throw new ArgumentException("--home requires a directory.");
-        Home = Path.GetFullPath(requested >= 0 ? args[requested + 1] : Bundled
-            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TMCP") : FindProject());
+        Home = Path.GetFullPath(requestedHome ?? (Bundled
+            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TMCP") : FindProject()));
         Project = Bundled ? Path.Combine(Home, "app", Payload!.Sha256[..20]) : Home;
     }
 
@@ -97,7 +96,22 @@ internal sealed class AppLayout
         var temporary = Path.Combine(Home, ".application-" + Guid.NewGuid().ToString("N") + ".tmp");
         try { await File.WriteAllTextAsync(temporary, metadata, cancellation); File.Move(temporary, Path.Combine(Home, "application.json"), true); }
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
+        InstallExecutable();
         progress.Report("Запускаем локальный сервер…");
+    }
+
+    private void InstallExecutable()
+    {
+        if (string.Equals(Environment.ProcessPath, Executable, StringComparison.OrdinalIgnoreCase)) return;
+        if (File.Exists(Executable))
+        {
+            var existing = FileVersionInfo.GetVersionInfo(Executable);
+            if (existing.ProductName != "TMCP Desktop") throw new IOException("The installation contains an unrelated TMCP.exe.");
+            if (System.Version.TryParse(existing.FileVersion, out var installed) && installed >= UpdateClient.ParseVersion(Payload!.Version)) return;
+        }
+        var temporary = Path.Combine(Home, ".TMCP-" + Guid.NewGuid().ToString("N") + ".exe");
+        try { File.Copy(Environment.ProcessPath!, temporary); File.Move(temporary, Executable, true); }
+        finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
 
     private void Extract(IProgress<string> progress, CancellationToken cancellation)

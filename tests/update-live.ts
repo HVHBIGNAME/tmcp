@@ -89,7 +89,14 @@ try {
   });
   assert.equal(created.status, 201);
   const { token: key } = await created.json();
-  const settings = await readFile(path.join(home, '.env'), 'utf8');
+  const saved = await ipcFetch(data, '/_control/api/settings', {
+    method: 'PATCH',
+    body: JSON.stringify({ ui: { theme: 'light', startMinimized: true } }),
+  });
+  assert.equal(saved.status, 200);
+  await saved.json();
+  const configuration = await readFile(path.join(home, '.env'), 'utf8');
+  const settings = await readFile(path.join(data, 'settings.json'), 'utf8');
   await page!.locator('nav [data-view="tokens"]').click();
   await page!.getByRole('button', { name: 'Новый токен' }).click();
   await expect
@@ -128,7 +135,8 @@ try {
     JSON.parse(await readFile(path.join(home, 'application.json'), 'utf8')).version,
     version,
   );
-  assert.equal(await readFile(path.join(home, '.env'), 'utf8'), settings);
+  assert.equal(await readFile(path.join(home, '.env'), 'utf8'), configuration);
+  assert.equal(await readFile(path.join(data, 'settings.json'), 'utf8'), settings);
   assert.equal(
     (
       await fetch(`http://127.0.0.1:${mcpPort}/mcp`, {

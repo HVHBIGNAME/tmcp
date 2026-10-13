@@ -70,6 +70,8 @@
 - Windows-сценарии также проверяют отмену частичной загрузки с повторной попыткой, удаление отозванного релиза и запрет автоматической повторной установки версии, ранее завершившейся ошибкой. Сообщение об ошибке больше не утверждает, что откат обязательно удался.
 - Команды: `dotnet run --project tests/UpdateClientTests/UpdateClientTests.csproj -c Release` и `dotnet run --project tests/WindowsUpdateTests/WindowsUpdateTests.csproj -c Release`. Обе проверки включены в Windows CI и release workflow.
 - Для проверки перехода с настоящего предыдущего релиза `test:update-live` принимает путь к его EXE в `TMCP_TEST_PREVIOUS_EXE`; без этой переменной используется локальная fixture.
+- 13.10.2026 прошёл автоматический переход с опубликованного EXE 2.1.0 на опубликованный 2.1.1: проверка digest, ожидание закрытия диалога, замена файла, запуск GUI/backend и сохранение ключа, `.env`, темы и режима свёрнутого запуска. Отдельно прошёл полный GUI-сценарий на скачанном EXE 2.1.1.
+- [Release workflow 2.1.1](https://github.com/HVHBIGNAME/tmcp/actions/runs/38336335407) завершился успешно. Windows installer smoke потребовал повтора из-за лимита GitHub API общего IP runner’а; проверки SHA-256 не обходились. Единственный asset — `TMCP.exe`, 447434810 байт, SHA-256 `56115a2cbbb89e888e0c57129d517c36dfc1eb45db4f7bd9ef5336e55c311b62`.
 
 ## Границы проверки
 

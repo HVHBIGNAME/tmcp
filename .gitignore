@@ -5,6 +5,8 @@ ui/bin/
 ui/obj/
 tests/UpdateClientTests/bin/
 tests/UpdateClientTests/obj/
+tests/WindowsUpdateTests/bin/
+tests/WindowsUpdateTests/obj/
 .env
 .env.*
 !.env.example

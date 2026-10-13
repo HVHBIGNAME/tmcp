@@ -13,7 +13,7 @@ internal sealed record UpdatePlan(UpdateRelease Release, string Directory, strin
 
 internal sealed class WindowsUpdates : IDisposable
 {
-    private readonly HttpClient _http = new() { Timeout = Timeout.InfiniteTimeSpan };
+    private readonly HttpClient _http;
     private readonly CancellationTokenSource _closed = new();
     private readonly Action<UpdateStatus> _changed;
     private readonly Func<UpdatePlan, Task<bool>> _install;
@@ -25,8 +25,9 @@ internal sealed class WindowsUpdates : IDisposable
     private UpdatePlan? _plan;
     internal UpdateStatus State { get; private set; }
 
-    internal WindowsUpdates(string home, string version, bool supported, Action<UpdateStatus> changed, Func<UpdatePlan, Task<bool>> install)
+    internal WindowsUpdates(string home, string version, bool supported, Action<UpdateStatus> changed, Func<UpdatePlan, Task<bool>> install, HttpClient? http = null)
     {
+        _http = http ?? new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
         _home = home; _version = version; _changed = changed; _install = install;
         State = new(supported, version, null, "idle", supported ? "Проверяем GitHub автоматически каждые 6 часов." : "Автообновление доступно в автономном Windows-приложении.", 0);
         var receipt = Path.Combine(home, ".updates", "status.json");
@@ -34,14 +35,15 @@ internal sealed class WindowsUpdates : IDisposable
         {
             try
             {
+                if (new FileInfo(receipt).Length > 65536) throw new InvalidDataException("The update receipt is too large.");
                 using var saved = JsonDocument.Parse(File.ReadAllText(receipt));
                 if (saved.RootElement.GetProperty("status").GetString() == "failed")
                 {
                     _blocked = saved.RootElement.GetProperty("version").GetString();
-                    State = State with { Status = "failed", Message = "Последнее обновление отменено. Предыдущая версия восстановлена. Можно повторить проверку вручную." };
+                    State = State with { Status = "failed", Message = "Последнее обновление завершилось ошибкой. Можно повторить проверку вручную." };
                 }
             }
-            catch (Exception error) when (error is IOException or JsonException or KeyNotFoundException) { Program.Log(error); }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException or KeyNotFoundException or InvalidOperationException) { Program.Log(error); }
         }
     }
 
@@ -75,28 +77,35 @@ internal sealed class WindowsUpdates : IDisposable
         if (!State.Supported || _busy || _disposed) return;
         _busy = true; _manual = manual;
         _request?.Dispose();
-        _request = CancellationTokenSource.CreateLinkedTokenSource(_closed.Token);
-        _request.CancelAfter(TimeSpan.FromMinutes(15));
+        var request = _request = CancellationTokenSource.CreateLinkedTokenSource(_closed.Token);
+        request.CancelAfter(TimeSpan.FromMinutes(15));
         string? directory = null;
         try
         {
-            DeletePlan();
             Set("checking", "Проверяем последнюю стабильную версию на GitHub…");
             var client = new UpdateClient(_http);
             using var metadataTimeout = CancellationTokenSource.CreateLinkedTokenSource(_request.Token);
             metadataTimeout.CancelAfter(TimeSpan.FromSeconds(30));
             var release = await client.LatestAsync(_version, metadataTimeout.Token);
             _nextCheck = DateTime.UtcNow.AddHours(6);
-            if (release == null) { Set("current", "Установлена актуальная версия."); return; }
-            if (release.Version == _blocked && !manual) { Set("failed", "Эта версия уже вызвала откат. Ожидаем следующий релиз или ручную повторную попытку."); return; }
+            if (release == null) { DeletePlan(); State = State with { AvailableVersion = null }; Set("current", "Установлена актуальная версия."); return; }
+            if (release.Version == _blocked && !manual) { DeletePlan(); Set("failed", "Установка этой версии уже завершилась ошибкой. Ожидаем следующий релиз или ручную повторную попытку."); return; }
             State = State with { AvailableVersion = release.Version };
+            if (_plan?.Release == release && File.Exists(_plan.Candidate))
+            { Set("waiting", "Проверенное обновление уже загружено. Ждём завершения работы и редактирования форм.", 100); return; }
+            DeletePlan();
             var root = Path.Combine(_home, ".updates");
             ProtectDirectory(root);
             directory = Path.Combine(root, Guid.NewGuid().ToString("N"));
             System.IO.Directory.CreateDirectory(directory);
             var candidate = Path.Combine(directory, "TMCP.exe");
             Set("downloading", $"Загружаем версию {release.Version}…");
-            await client.DownloadAsync(release, candidate, new Progress<int>(value => Set("downloading", $"Загружаем версию {release.Version}: {value}%", value)), _request.Token);
+            var progress = new Progress<int>(value =>
+            {
+                if (!_disposed && ReferenceEquals(_request, request) && !request.IsCancellationRequested && State.Status == "downloading")
+                    Set("downloading", $"Загружаем версию {release.Version}: {value}%", value);
+            });
+            await client.DownloadAsync(release, candidate, progress, request.Token);
             _plan = new(release, directory, candidate); directory = null;
             Set("waiting", "SHA-256 проверен. Обновление установится автоматически, когда приложение освободится.", 100);
         }

@@ -63,6 +63,7 @@ jobs:
           npm run build:standalone
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - run: dotnet run --project tests/UpdateClientTests/UpdateClientTests.csproj -c Release
+      - run: dotnet run --project tests/WindowsUpdateTests/WindowsUpdateTests.csproj -c Release
       - name: Test standalone runtime and installation
         shell: powershell
         env:

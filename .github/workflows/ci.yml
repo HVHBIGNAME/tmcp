@@ -74,3 +74,4 @@ jobs:
       - run: npm ci
       - run: npm run build:ui
       - run: dotnet run --project tests/UpdateClientTests/UpdateClientTests.csproj -c Release
+      - run: dotnet run --project tests/WindowsUpdateTests/WindowsUpdateTests.csproj -c Release

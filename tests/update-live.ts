@@ -19,7 +19,12 @@ const home = path.join(base, 'home');
 const download = path.join(base, 'download');
 await mkdir(download);
 const oldExe = path.join(download, 'TMCP.exe');
-await cp(path.resolve('.mcp-tunnel/update-fixture/published/PcMcp.exe'), oldExe);
+await cp(
+  path.resolve(
+    process.env.TMCP_TEST_PREVIOUS_EXE ?? '.mcp-tunnel/update-fixture/published/PcMcp.exe',
+  ),
+  oldExe,
+);
 const data = path.join(home, '.mcp-tunnel');
 async function port() {
   const socket = createServer();

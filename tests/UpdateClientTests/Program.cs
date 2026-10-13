@@ -57,6 +57,7 @@ try
     download = new byte[] { 77, 90 };
     await Reject(() => client.DownloadAsync(release, filename, new Progress<int>(), default));
     Check(Directory.GetFiles(directory).Length == 0, "Partial download was not removed");
+    await DownloadFailureTests.Run(release, bytes, directory);
 }
 finally { Directory.Delete(directory, true); }
 Console.WriteLine("Update client verified: version ordering, stable releases, repository-bound URL, metadata limits, SHA-256 and partial-file cleanup.");

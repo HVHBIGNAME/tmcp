@@ -63,12 +63,14 @@ internal sealed class UpdateClient(HttpClient http)
         if (response.Content.Headers.ContentLength is { } length && length != release.Size)
             throw new InvalidDataException("Update length differs from the GitHub release.");
         var temporary = destination + ".part";
+        var ownsTemporary = false;
         try
         {
             await using (var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            await using (var input = await response.Content.ReadAsStreamAsync(cancellation))
-            using (var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
             {
+                ownsTemporary = true;
+                await using var input = await response.Content.ReadAsStreamAsync(cancellation);
+                using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
                 var buffer = new byte[65536];
                 long total = 0;
                 var previous = -1;
@@ -86,10 +88,12 @@ internal sealed class UpdateClient(HttpClient http)
                     throw new InvalidDataException("The downloaded update failed SHA-256 verification.");
                 await output.FlushAsync(cancellation);
             }
+            cancellation.ThrowIfCancellationRequested();
             using (var input = File.OpenRead(temporary))
                 if (input.ReadByte() != 'M' || input.ReadByte() != 'Z') throw new InvalidDataException("The update is not a Windows executable.");
+            cancellation.ThrowIfCancellationRequested();
             File.Move(temporary, destination);
         }
-        finally { if (File.Exists(temporary)) File.Delete(temporary); }
+        finally { if (ownsTemporary && File.Exists(temporary)) File.Delete(temporary); }
     }
 }

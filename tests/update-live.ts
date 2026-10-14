@@ -50,6 +50,7 @@ let child: ChildProcess | undefined, browser: Browser | undefined;
 let page!: Page;
 let updatedPid: number | undefined;
 let success = false;
+let installerOutput = '';
 async function connect() {
   for (let i = 0; i < 600; i++) {
     try {
@@ -82,8 +83,14 @@ try {
   child = spawn(oldExe, ['--home', home, '--show', '--local'], {
     cwd: download,
     env: environment,
-    stdio: 'ignore',
+    stdio: process.env.TMCP_TEST_CAPTURE_OUTPUT === '1' ? ['ignore', 'pipe', 'pipe'] : 'ignore',
   });
+  for (const stream of [child.stdout, child.stderr]) {
+    stream?.setEncoding('utf8');
+    stream?.on('data', (text: string) => {
+      installerOutput = (installerOutput + text).slice(-8000);
+    });
+  }
   await connect();
   await page!.evaluate(
     `window.__observedUpdate = null; chrome.webview.addEventListener('message', event => { if (event.data.type === 'update-status') window.__observedUpdate = event.data.update; });`,
@@ -171,6 +178,10 @@ try {
   console.log(
     'Automatic GitHub update verified: no manual check/install action, idle-dialog deferral, verified release download, complete EXE replacement, new GUI/backend startup, preserved key/configuration.',
   );
+} catch (error) {
+  const update = await page?.evaluate('window.__observedUpdate').catch(() => undefined);
+  console.error('Automatic update failure:', { update, installerOutput });
+  throw error;
 } finally {
   await browser?.close();
   try {

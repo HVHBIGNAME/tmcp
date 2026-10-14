@@ -210,8 +210,8 @@ try {
     registration,
   ]);
   assert(registered.stdout.includes(`"${startup.executable}" --autostart --home "${home}"`));
-  const keysBefore = await readFile(path.join(data, 'tokens.json'), 'utf8');
   await quit();
+  const keysBefore = await readFile(path.join(data, 'tokens.json'), 'utf8');
   await rm(download, { recursive: true });
   child = spawn(startup.executable, ['--autostart', '--home', home], {
     cwd: home,

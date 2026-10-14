@@ -27,6 +27,9 @@ import { connectionView } from './connection.js';
 import { autostartFor, type AutostartControl } from './autostart.js';
 import { Traffic, type TrafficSpan } from './traffic.js';
 import { controlPrivatePaths } from './ipc.js';
+import { RequestCancellations } from './request-cancellations.js';
+import { requiredPermission } from './tool-contracts.js';
+import { toolError } from './tool-result.js';
 
 export interface HttpOptions {
   log?: Logger;
@@ -59,12 +62,15 @@ const clientKey: Options['keyGenerator'] = (req) => {
 
 export async function createApp(config: Config, options: HttpOptions = {}) {
   let maintenanceUntil = 0;
+  const cancellations = new RequestCancellations();
   const log =
     options.log ??
     ((event) => console.log(JSON.stringify({ time: new Date().toISOString(), ...event })));
   const workspace = await Workspace.open(config.roots, [
     path.join(config.projectDir, '.env'),
     config.envFile,
+    config.serversFile,
+    ...config.configPaths,
     config.dataDir,
     ...(config.desktopExecutable ? [path.dirname(config.envFile), config.desktopExecutable] : []),
     ...(await controlPrivatePaths(config.dataDir)),
@@ -99,7 +105,7 @@ export async function createApp(config: Config, options: HttpOptions = {}) {
   await settings.load();
   config.gatewayDiscover = settings.get().gateway.discover;
   config.gatewayMode = settings.get().gateway.mode;
-  const gateway = new Gateway(config, log);
+  const gateway = new Gateway(config, log, (paths) => workspace.protect(paths));
   await gateway.reload(!options.deferGatewayWarmup);
   const approvals = new Approvals();
   const auditFile = path.join(config.dataDir, 'audit.log');
@@ -552,9 +558,71 @@ export async function createApp(config: Config, options: HttpOptions = {}) {
     async (req, res, next) => {
       const span = res.locals.traffic as TrafficSpan;
       span.describe(req.body?.method, req.body?.params?.name);
+      const caller = res.locals.caller as Caller;
+      const toolName = req.body?.params?.name;
+      const permission = typeof toolName === 'string' ? requiredPermission(toolName) : undefined;
+      if (
+        req.body?.method === 'tools/call' &&
+        permission &&
+        !caller.permissions.includes(permission)
+      ) {
+        span.deny();
+        if (settings.get().logging.enabled)
+          await audit
+            .write({
+              at: new Date().toISOString(),
+              actor: caller.tokenName ?? caller.id,
+              clientId: caller.id,
+              kind: toolName.includes('command') ? 'command' : 'file',
+              action: toolName,
+              detail: '',
+              outcome: 'denied',
+              durationMs: null,
+            })
+            .catch((error) => log({ event: 'audit_write_error', message: errorMessage(error) }));
+        res.json({
+          jsonrpc: '2.0',
+          id: req.body.id ?? null,
+          result: toolError(
+            new Error(
+              `Access denied: ${toolName} needs the "${permission}" permission, which this token does not have. The owner can grant it in PC MCP under Access.`,
+            ),
+          ),
+        });
+        return;
+      }
+      if (
+        req.body?.jsonrpc === '2.0' &&
+        req.body?.method === 'notifications/cancelled' &&
+        req.body.id === undefined
+      ) {
+        cancellations.cancel(caller.id, req.body.params?.requestId);
+        res.status(202).end();
+        return;
+      }
+      const execution = cancellations.track(
+        caller.id,
+        req.body?.method === 'tools/call' ? req.body.id : undefined,
+      );
+      res.once('finish', execution.finish);
+      res.once('close', () => {
+        if (!res.writableFinished) execution.abort();
+        execution.finish();
+      });
       const server = createMcpServer(
-        { config, files, processes, log, gateway, approvals, audit, settings, traffic: span },
-        res.locals.caller as Caller,
+        {
+          config,
+          files,
+          processes,
+          log,
+          gateway,
+          approvals,
+          audit,
+          settings,
+          traffic: span,
+          signal: execution.signal,
+        },
+        caller,
       );
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
@@ -670,6 +738,7 @@ export async function createApp(config: Config, options: HttpOptions = {}) {
     close: () =>
       (closing ??= (async () => {
         traffic.close();
+        cancellations.close();
         approvals.cancelAll('The server stopped');
         unsubscribeApprovals();
         const results = await Promise.allSettled([

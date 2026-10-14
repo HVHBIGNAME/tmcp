@@ -112,3 +112,40 @@ test('find/search limits and explicit recursive deletion', async (t) => {
   await files.delete('src', true);
   assert.equal((await files.info('moved.txt')).type, 'file');
 });
+
+test('long text pages provide a lossless continuation within the same line', async (t) => {
+  const { root } = await fixture(t);
+  const files = new Files(await Workspace.open([root]), 400000);
+  const text = '🙂'.repeat(90000);
+  await files.write('long.txt', text, false, false);
+  const page = await files.read('long.txt', 1, 300, 1, 1000);
+  assert(page.content.length <= 1000);
+  assert.equal(page.next_line, 1);
+  assert(page.next_column && page.next_column > 1);
+  assert(!page.content.endsWith('\ud83d'), 'A UTF-16 surrogate pair must not be split');
+  let collected = '',
+    line = 1,
+    column = 1;
+  for (let n = 0; n < 1000; n++) {
+    const part = await files.read('long.txt', line, 300, column, 1000);
+    collected += part.content.replace(/^1: /, '');
+    if (part.next_line === null) break;
+    line = part.next_line;
+    column = part.next_column!;
+  }
+  assert.equal(collected, text);
+});
+
+test('directory and search pages do not repeat matches and show the matched excerpt', async (t) => {
+  const { root } = await fixture(t);
+  const files = new Files(await Workspace.open([root]), 10000);
+  for (const name of ['a', 'b', 'c'])
+    await files.write(name, 'x'.repeat(3000) + 'needle', false, false);
+  const first = await files.list('.', 1, 1, false);
+  const second = await files.list('.', 1, 1, false, first.next_offset!);
+  assert.notEqual(first.entries[0]?.path, second.entries[0]?.path);
+  const found = await files.search('.', 'needle', '**/*', false, 1);
+  assert.match(found.matches[0]!.text, /needle/);
+  const next = await files.search('.', 'needle', '**/*', false, 1, found.next_offset!);
+  assert.notEqual(found.matches[0]?.path, next.matches[0]?.path);
+});

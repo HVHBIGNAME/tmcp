@@ -3,6 +3,7 @@ import path from 'node:path';
 import picomatch from 'picomatch';
 import { atomicWrite, hash, isErrno, SerialQueue } from './utils.js';
 import type { Workspace } from './workspace.js';
+import { textPage } from './text-page.js';
 
 const ignoredDirectories = new Set([
   '.git',
@@ -35,7 +36,8 @@ export class Files {
     readonly maxBytes: number,
   ) {}
 
-  async readBytes(input: string, maximum = this.maxBytes): Promise<Buffer> {
+  async readBytes(input: string, maximum = this.maxBytes, signal?: AbortSignal): Promise<Buffer> {
+    signal?.throwIfAborted();
     const filename = await this.workspace.resolve(input);
     const handle = await open(filename, 'r');
     try {
@@ -45,6 +47,7 @@ export class Files {
       const data = Buffer.alloc(Math.min(info.size + 1, maximum + 1));
       let length = 0;
       while (length < data.length) {
+        signal?.throwIfAborted();
         const { bytesRead } = await handle.read(data, length, data.length - length, null);
         if (!bytesRead) break;
         length += bytesRead;
@@ -61,24 +64,21 @@ export class Files {
     return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(data);
   }
 
-  async read(input: string, startLine: number, maxLines: number) {
+  async read(
+    input: string,
+    startLine: number,
+    maxLines: number,
+    startColumn = 1,
+    maxChars = 32000,
+    signal?: AbortSignal,
+  ) {
     const filename = await this.workspace.resolve(input);
-    const data = await this.readBytes(filename);
+    const data = await this.readBytes(filename, this.maxBytes, signal);
     const text = this.decode(data);
-    const lines = text ? text.split('\n') : [];
-    if (lines.at(-1) === '') lines.pop();
-    const selected = lines.slice(startLine - 1, startLine - 1 + maxLines);
-    const content = selected
-      .map((line, index) => `${startLine + index}: ${line.replace(/\r$/, '')}`)
-      .join('\n');
     return {
       path: filename,
       sha256: hash(data),
-      total_lines: lines.length,
-      start_line: startLine,
-      next_line: startLine + selected.length <= lines.length ? startLine + selected.length : null,
-      content: content.slice(0, 250000),
-      truncated: content.length > 250000,
+      ...textPage(text, startLine, maxLines, startColumn, maxChars),
     };
   }
 
@@ -87,20 +87,35 @@ export class Files {
     const info = await lstat(filename);
     return {
       path: filename,
-      type: info.isSymbolicLink() ? 'symlink' : info.isDirectory() ? 'directory' : 'file',
+      type: info.isSymbolicLink()
+        ? 'symlink'
+        : info.isDirectory()
+          ? 'directory'
+          : info.isFile()
+            ? 'file'
+            : 'other',
       bytes: info.size,
       modified_at: info.mtime.toISOString(),
     };
   }
 
-  async *walk(input: string, maxDepth: number, includeIgnored: boolean): AsyncGenerator<WalkEntry> {
+  async *walk(
+    input: string,
+    maxDepth: number,
+    includeIgnored: boolean,
+    signal?: AbortSignal,
+  ): AsyncGenerator<WalkEntry> {
     const root = await this.workspace.resolve(input);
     const pending = [{ directory: root, depth: 1 }];
     while (pending.length) {
+      signal?.throwIfAborted();
       const { directory, depth } = pending.pop()!;
       // Recheck ancestors in case a directory was replaced with a junction during traversal.
       const safeDirectory = await this.workspace.resolve(directory);
-      for (const entry of await readdir(safeDirectory, { withFileTypes: true })) {
+      const children = await readdir(safeDirectory, { withFileTypes: true });
+      children.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+      for (const entry of children) {
+        signal?.throwIfAborted();
         if (!includeIgnored && entry.isDirectory() && ignoredDirectories.has(entry.name)) continue;
         const filename = path.join(safeDirectory, entry.name);
         if (this.workspace.isPrivate(filename)) continue;
@@ -123,36 +138,99 @@ export class Files {
     }
   }
 
-  async list(input: string, depth: number, limit: number, includeIgnored: boolean) {
+  private async collect(
+    walk: AsyncGenerator<WalkEntry>,
+    matches: (entry: WalkEntry) => boolean,
+    limit: number,
+    offset: number,
+  ) {
     const entries: WalkEntry[] = [];
-    for await (const entry of this.walk(input, depth, includeIgnored)) {
-      if (entries.length === limit) return { entries, truncated: true };
+    let scanned = 0,
+      skipped = 0,
+      size = 0;
+    for await (const entry of walk) {
+      if (++scanned > scanLimit)
+        return {
+          entries,
+          scanned: scanned - 1,
+          truncated: true,
+          next_offset: null,
+          scan_limit_reached: true,
+        };
+      if (!matches(entry) || skipped++ < offset) continue;
+      const cost = JSON.stringify(entry).length;
+      if (entries.length === limit || size + cost > 64000)
+        return {
+          entries,
+          scanned,
+          truncated: true,
+          next_offset: offset + entries.length,
+          scan_limit_reached: false,
+        };
       entries.push(entry);
+      size += cost;
     }
-    return { entries, truncated: false };
+    return { entries, scanned, truncated: false, next_offset: null, scan_limit_reached: false };
   }
 
-  async find(input: string, pattern: string, limit: number, includeIgnored: boolean) {
+  async list(
+    input: string,
+    depth: number,
+    limit: number,
+    includeIgnored: boolean,
+    offset = 0,
+    signal?: AbortSignal,
+  ) {
+    return this.collect(this.walk(input, depth, includeIgnored, signal), () => true, limit, offset);
+  }
+
+  async find(
+    input: string,
+    pattern: string,
+    limit: number,
+    includeIgnored: boolean,
+    offset = 0,
+    signal?: AbortSignal,
+  ) {
     const matches = picomatch(pattern, { dot: true, nocase: process.platform === 'win32' });
-    const entries: WalkEntry[] = [];
-    let scanned = 0;
-    for await (const entry of this.walk(input, 100, includeIgnored)) {
-      if (++scanned > scanLimit) return { entries, scanned: scanned - 1, truncated: true };
-      if (!matches(entry.relative)) continue;
-      if (entries.length === limit) return { entries, scanned, truncated: true };
-      entries.push(entry);
-    }
-    return { entries, scanned, truncated: false };
+    return this.collect(
+      this.walk(input, 100, includeIgnored, signal),
+      (entry) => matches(entry.relative),
+      limit,
+      offset,
+    );
   }
 
-  async search(input: string, query: string, glob: string, caseSensitive: boolean, limit: number) {
+  async search(
+    input: string,
+    query: string,
+    glob: string,
+    caseSensitive: boolean,
+    limit: number,
+    offset = 0,
+    signal?: AbortSignal,
+  ) {
+    if (/[\r\n]/.test(query))
+      throw new Error('query must be a single-line literal; use read_file for multiline text');
     const matches = picomatch(glob, { dot: true, nocase: process.platform === 'win32' });
-    const needle = caseSensitive ? query : query.toLowerCase();
-    const results: { path: string; line: number; text: string }[] = [];
+    const needle = new RegExp(
+      query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+      caseSensitive ? 'u' : 'iu',
+    );
+    const results: {
+      path: string;
+      line: number;
+      column: number;
+      text: string;
+      text_start_column: number;
+      text_truncated: boolean;
+    }[] = [];
     const skipped: { path: string; reason: string }[] = [];
     let scanned = 0;
     let skippedCount = 0;
-    for await (const entry of this.walk(input, 100, false)) {
+    let matched = 0,
+      outputSize = 0;
+    for await (const entry of this.walk(input, 100, false, signal)) {
       if (++scanned > scanLimit)
         return {
           matches: results,
@@ -160,12 +238,15 @@ export class Files {
           skipped_count: skippedCount,
           scanned: scanned - 1,
           truncated: true,
+          next_offset: null,
+          scan_limit_reached: true,
         };
       if (entry.type !== 'file' || !matches(entry.relative)) continue;
       let content: string;
       try {
-        content = this.decode(await this.readBytes(entry.path));
+        content = this.decode(await this.readBytes(entry.path, this.maxBytes, signal));
       } catch (error) {
+        signal?.throwIfAborted();
         skippedCount++;
         if (skipped.length < 20)
           skipped.push({
@@ -175,19 +256,42 @@ export class Files {
         continue;
       }
       for (const [index, line] of content.split('\n').entries()) {
-        if (!(caseSensitive ? line : line.toLowerCase()).includes(needle)) continue;
-        if (results.length === limit)
+        signal?.throwIfAborted();
+        const match = needle.exec(line);
+        if (!match || matched++ < offset) continue;
+        const from = Math.max(0, match.index - 100);
+        const result = {
+          path: entry.path,
+          line: index + 1,
+          column: match.index + 1,
+          text: line.slice(from, from + 2000),
+          text_start_column: from + 1,
+          text_truncated: from > 0 || line.length > from + 2000,
+        };
+        const cost = JSON.stringify(result).length;
+        if (results.length === limit || outputSize + cost > 64000)
           return {
             matches: results,
             skipped,
             skipped_count: skippedCount,
             scanned,
             truncated: true,
+            next_offset: offset + results.length,
+            scan_limit_reached: false,
           };
-        results.push({ path: entry.path, line: index + 1, text: line.slice(0, 2000) });
+        results.push(result);
+        outputSize += cost;
       }
     }
-    return { matches: results, skipped, skipped_count: skippedCount, scanned, truncated: false };
+    return {
+      matches: results,
+      skipped,
+      skipped_count: skippedCount,
+      scanned,
+      truncated: false,
+      next_offset: null,
+      scan_limit_reached: false,
+    };
   }
 
   private checkSize(content: string): void {
@@ -207,9 +311,11 @@ export class Files {
     overwrite: boolean,
     createParents: boolean,
     expected?: string,
+    signal?: AbortSignal,
   ) {
     this.checkSize(content);
     return this.writes.run(async () => {
+      signal?.throwIfAborted();
       const filename = await this.workspace.resolve(input);
       await this.checkHash(filename, expected);
       if (createParents) await mkdir(path.dirname(filename), { recursive: true });
@@ -222,8 +328,9 @@ export class Files {
         } catch (error) {
           if (!isErrno(error, 'ENOENT')) throw error;
         }
-        await atomicWrite(filename, content, mode);
+        await atomicWrite(filename, content, mode, signal);
       } else {
+        signal?.throwIfAborted();
         const handle = await open(filename, 'wx', 0o600);
         try {
           await handle.writeFile(content, 'utf8');
@@ -235,15 +342,17 @@ export class Files {
     });
   }
 
-  async edit(input: string, edits: Edit[], expected?: string) {
+  async edit(input: string, edits: Edit[], expected?: string, signal?: AbortSignal) {
     return this.writes.run(async () => {
+      signal?.throwIfAborted();
       const filename = await this.workspace.resolve(input);
-      const original = await this.readBytes(filename);
+      const original = await this.readBytes(filename, this.maxBytes, signal);
       if (expected && hash(original) !== expected)
         throw new Error('File has changed (sha256 mismatch)');
       let content = this.decode(original);
       let replacements = 0;
       for (const edit of edits) {
+        signal?.throwIfAborted();
         if (!edit.old_text || edit.old_text === edit.new_text)
           throw new Error('Edits require non-empty, different old_text and new_text');
         const parts = content.split(edit.old_text);
@@ -259,20 +368,21 @@ export class Files {
         this.checkSize(content);
       }
       await this.checkHash(filename, hash(original));
-      await atomicWrite(filename, content, (await stat(filename)).mode);
+      await atomicWrite(filename, content, (await stat(filename)).mode, signal);
       return { path: filename, replacements, sha256: hash(content) };
     });
   }
 
-  async makeDirectory(input: string) {
+  async makeDirectory(input: string, signal?: AbortSignal) {
     return this.writes.run(async () => {
       const directory = await this.workspace.resolve(input);
+      signal?.throwIfAborted();
       await mkdir(directory, { recursive: true });
       return { path: directory };
     });
   }
 
-  async move(source: string, destination: string) {
+  async move(source: string, destination: string, signal?: AbortSignal) {
     return this.writes.run(async () => {
       const from = await this.workspace.resolve(source, false);
       const to = await this.workspace.resolve(destination, false);
@@ -284,16 +394,18 @@ export class Files {
       } catch (error) {
         if (!isErrno(error, 'ENOENT')) throw error;
       }
+      signal?.throwIfAborted();
       await rename(from, to);
       return { source: from, destination: to };
     });
   }
 
-  async delete(input: string, recursive: boolean) {
+  async delete(input: string, recursive: boolean, signal?: AbortSignal) {
     return this.writes.run(async () => {
       const filename = await this.workspace.resolve(input, false);
       this.workspace.assertMutable(filename);
       const info = await lstat(filename);
+      signal?.throwIfAborted();
       if (info.isDirectory() && !recursive) await rmdir(filename);
       else await rm(filename, { recursive, force: false });
       return { deleted: filename };

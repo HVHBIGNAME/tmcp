@@ -8,6 +8,9 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { chromium, expect, type Browser, type Page } from '@playwright/test';
 import { ipcFetch } from '../src/ipc.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { CallToolResultSchema } from '@modelcontextprotocol/sdk/types.js';
 
 if (process.platform !== 'win32') throw new Error('Standalone smoke requires Windows.');
 const run = promisify(execFile);
@@ -37,7 +40,7 @@ Object.assign(environment, {
   MCP_LOCAL_ONLY: 'true',
   TMCP_DISABLE_UPDATES: 'true',
   MCP_GATEWAY_DISCOVER: 'false',
-  MCP_ENABLE_SCREENSHOTS: 'false',
+  MCP_ENABLE_SCREENSHOTS: 'true',
   WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${debugPort}`,
 });
 let child: ChildProcess | undefined, browser: Browser | undefined;
@@ -157,6 +160,36 @@ try {
   });
   assert.equal(response.status, 200);
   await response.arrayBuffer();
+  const issued = await ipcFetch(data, '/_control/api/tokens', {
+    method: 'POST',
+    body: JSON.stringify({ name: 'Bundled capture audit', permissions: ['screen'] }),
+  });
+  assert.equal(issued.status, 201);
+  const captureKey = await issued.json();
+  const captureClient = new Client({ name: 'bundled-capture-smoke', version: '1' });
+  try {
+    await captureClient.connect(
+      new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${mcpPort}/mcp`), {
+        requestInit: { headers: { Authorization: `Bearer ${captureKey.token}` } },
+      }),
+    );
+    await captureClient.listTools();
+    const displays = CallToolResultSchema.parse(
+      await captureClient.callTool({ name: 'list_displays', arguments: {} }),
+    );
+    assert(!displays.isError, JSON.stringify(displays.content));
+    const image = CallToolResultSchema.parse(
+      await captureClient.callTool({
+        name: 'take_screenshot',
+        arguments: { display: 0, max_size: 640 },
+      }),
+    );
+    assert(!image.isError, JSON.stringify(image.content.filter((item) => item.type === 'text')));
+    assert.equal(image.content[0]?.type, 'image');
+    assert(Number(image.structuredContent?.width) <= 640);
+  } finally {
+    await captureClient.close();
+  }
   await page.locator('nav [data-view="settings"]').click();
   await page.getByRole('checkbox', { name: 'Запускать свёрнутым в трей' }).check();
   await expect.poll(async () => (await api('/state')).settings.ui.startMinimized).toBe(true);

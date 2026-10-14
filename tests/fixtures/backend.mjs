@@ -1,4 +1,4 @@
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { readFile, writeFile } from 'node:fs/promises';
@@ -11,8 +11,8 @@ server.registerTool(
     inputSchema: { text: z.string(), delay_ms: z.number().default(0) },
     annotations: { readOnlyHint: true },
   },
-  async ({ text, delay_ms }) => {
-    await delay(delay_ms);
+  async ({ text, delay_ms }, extra) => {
+    await delay(delay_ms, undefined, { signal: extra.signal });
     return { content: [{ type: 'text', text }], structuredContent: { echoed: text } };
   },
 );
@@ -45,6 +45,19 @@ server.registerTool(
 );
 server.registerResource('hello', 'fixture://hello', { mimeType: 'text/plain' }, () => ({
   contents: [{ uri: 'fixture://hello', text: 'resource text' }],
+}));
+server.registerResource(
+  'item',
+  new ResourceTemplate('fixture://item/{id}', { list: undefined }),
+  {},
+  (uri, { id }) => ({ contents: [{ uri: uri.href, text: `item ${id}` }] }),
+);
+server.registerResource('slow', 'fixture://slow', {}, async (uri, extra) => {
+  await delay(30000, undefined, { signal: extra.signal });
+  return { contents: [{ uri: uri.href, text: 'late' }] };
+});
+server.registerTool('long_' + 'name'.repeat(25), { inputSchema: {} }, () => ({
+  content: [{ type: 'text', text: 'long tool name' }],
 }));
 server.registerPrompt('greet', { argsSchema: { name: z.string() } }, ({ name }) => ({
   messages: [{ role: 'user', content: { type: 'text', text: `Hello ${name}` } }],

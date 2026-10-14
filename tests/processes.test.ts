@@ -18,7 +18,7 @@ test('commands capture exit status, handle background polling and isolate client
   for (let attempt = 0; job.status === 'running' && attempt < 10; attempt++)
     job = await processes.read('alice', job.job_id, 0, 0, 1000);
   assert.equal(job.status, 'failed');
-  assert.equal(job.exit_code, 7);
+  assert.equal(job.exit_code, 7, job.stderr);
   assert.match(job.stdout, /Привет MCP/);
   assert.match(job.stderr, /failure/);
   const next = await processes.read('alice', job.job_id, job.stdout_cursor, job.stderr_cursor, 0);
@@ -38,7 +38,7 @@ test('timeouts terminate long-running command processes and output memory is bou
   });
   for (let attempt = 0; output.status === 'running' && attempt < 10; attempt++)
     output = await processes.read('alice', output.job_id, 0, 0, 1000);
-  assert.equal(output.exit_code, 0);
+  assert.equal(output.exit_code, 0, output.stderr);
   assert.equal(output.stdout.length, 2048);
   assert.equal(output.stdout_truncated, true);
   let long = await processes.run('alice', {
@@ -54,3 +54,40 @@ test('timeouts terminate long-running command processes and output memory is bou
   assert(long.pid);
   assert.equal(isAlive(long.pid), false);
 });
+
+test('supported alternative shell preserves quoted arguments', async (t) => {
+  const { root, config } = await fixture(t);
+  const processes = new Processes(await Workspace.open([root]), config);
+  t.after(() => processes.shutdown());
+  let job = await processes.run('owner', {
+    command: 'node -e "console.log(process.argv[1])" "argument with spaces"',
+    shell: process.platform === 'win32' ? 'cmd' : 'sh',
+    cwd: '.',
+    keep_stdin: false,
+    wait_ms: 1000,
+  });
+  for (let n = 0; job.status === 'running' && n < 10; n++)
+    job = await processes.read('owner', job.job_id, 0, 0, 1000);
+  assert.equal(job.exit_code, 0, job.stderr);
+  assert.match(job.stdout, /argument with spaces/);
+});
+
+test(
+  'Windows cmd builtins return readable Unicode',
+  { skip: process.platform !== 'win32' },
+  async (t) => {
+    const { root, config } = await fixture(t);
+    const processes = new Processes(await Workspace.open([root]), config);
+    t.after(() => processes.shutdown());
+    let job = await processes.run('owner', {
+      command: 'echo Привет MCP',
+      shell: 'cmd',
+      cwd: '.',
+      keep_stdin: false,
+      wait_ms: 1000,
+    });
+    for (let n = 0; job.status === 'running' && n < 10; n++)
+      job = await processes.read('owner', job.job_id, 0, 0, 1000);
+    assert.match(job.stdout, /Привет MCP/);
+  },
+);

@@ -38,6 +38,20 @@ export class Workspace {
     return new Workspace([...new Set(canonical)], [...new Set(privatePaths_)]);
   }
 
+  async protect(paths: string[]): Promise<void> {
+    for (const target of paths) {
+      const absolute = path.resolve(target);
+      let canonical = absolute;
+      try {
+        canonical = await realpath(absolute);
+      } catch (error) {
+        if (!isErrno(error, 'ENOENT')) throw error;
+      }
+      for (const candidate of [absolute, canonical])
+        if (!this.privatePaths.includes(candidate)) this.privatePaths.push(candidate);
+    }
+  }
+
   contains(candidate: string): boolean {
     return this.roots.some((root) => {
       const relative = path.relative(root, candidate);

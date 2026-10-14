@@ -1,9 +1,9 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import { errorMessage } from '../utils.js';
 import type { Gateway } from './gateway.js';
 import type { TrafficSpan } from '../traffic.js';
+import { jsonResult, toolError } from '../tool-result.js';
 
 const serverId = z.string().min(1).max(100).describe('Exact id returned by mcp_list_servers');
 const readonly = {
@@ -25,37 +25,45 @@ export function registerGatewayTools(
   gateway: Gateway,
   owner: string,
   traffic?: TrafficSpan,
-): void {
+  signal?: AbortSignal,
+): string[] {
+  const names: string[] = [];
+  const register: typeof server.registerTool = (name, definition, callback) => {
+    names.push(name);
+    return server.registerTool(name, definition, callback);
+  };
   async function execute(
     operation: () => Promise<CallToolResult>,
     target?: string,
   ): Promise<CallToolResult> {
     traffic?.running(undefined, target);
     try {
+      signal?.throwIfAborted();
       const result = await operation();
       traffic?.result(Boolean(result.isError));
       return result;
     } catch (error) {
       traffic?.result(true);
-      return { isError: true, content: [{ type: 'text', text: errorMessage(error) }] };
+      return toolError(error);
     }
   }
   const json = (operation: () => Promise<Record<string, unknown>> | Record<string, unknown>) =>
     execute(async () => {
       const result = await operation();
-      return {
-        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-        structuredContent: result,
-      };
+      return jsonResult(result);
     });
   const catalog = (
     id: string,
     name: string,
-    operation: () => Promise<Record<string, unknown>>,
+    operation: (signal: AbortSignal) => Promise<Record<string, unknown>>,
     waitMs = 1000,
-  ) => execute(() => gateway.catalogCall(owner, id, name, operation, waitMs), `${id} · ${name}`);
+  ) =>
+    execute(
+      () => gateway.catalogCall(owner, id, name, operation, waitMs, signal),
+      `${id} · ${name}`,
+    );
 
-  server.registerTool(
+  register(
     'mcp_list_servers',
     {
       description:
@@ -66,7 +74,7 @@ export function registerGatewayTools(
     () => json(() => gateway.listServers()),
   );
 
-  server.registerTool(
+  register(
     'mcp_list_tools',
     {
       description:
@@ -85,12 +93,20 @@ export function registerGatewayTools(
       catalog(
         args.server_id,
         'tools/list',
-        () => gateway.listTools(args.server_id, args.cursor, args.query, args.offset, args.limit),
+        (signal) =>
+          gateway.listTools(
+            args.server_id,
+            args.cursor,
+            args.query,
+            args.offset,
+            args.limit,
+            signal,
+          ),
         args.wait_ms,
       ),
   );
 
-  server.registerTool(
+  register(
     'mcp_call_tool',
     {
       description:
@@ -105,12 +121,13 @@ export function registerGatewayTools(
     },
     (args) =>
       execute(
-        () => gateway.callTool(owner, args.server_id, args.tool, args.arguments, args.wait_ms),
+        () =>
+          gateway.callTool(owner, args.server_id, args.tool, args.arguments, args.wait_ms, signal),
         `${args.server_id} · ${args.tool}`,
       ),
   );
 
-  server.registerTool(
+  register(
     'mcp_read_call',
     {
       description:
@@ -118,10 +135,10 @@ export function registerGatewayTools(
       inputSchema: { call_id: z.string().uuid(), wait_ms: wait },
       annotations: readonly,
     },
-    (args) => execute(() => gateway.readCall(owner, args.call_id, args.wait_ms)),
+    (args) => execute(() => gateway.readCall(owner, args.call_id, args.wait_ms, signal)),
   );
 
-  server.registerTool(
+  register(
     'mcp_cancel_call',
     {
       description:
@@ -132,7 +149,7 @@ export function registerGatewayTools(
     (args) => json(() => gateway.cancelCall(owner, args.call_id)),
   );
 
-  server.registerTool(
+  register(
     'mcp_reload_servers',
     {
       description:
@@ -147,7 +164,7 @@ export function registerGatewayTools(
       }),
   );
 
-  server.registerTool(
+  register(
     'mcp_list_resources',
     {
       description:
@@ -156,50 +173,67 @@ export function registerGatewayTools(
         server_id: serverId,
         templates: z.boolean().default(false),
         cursor: z.string().optional(),
+        wait_ms: wait,
       },
       annotations: readonly,
     },
     (args) =>
-      catalog(args.server_id, 'resources/list', async () => {
-        const client = await gateway.client(args.server_id);
-        return args.templates
-          ? client.listResourceTemplates({ cursor: args.cursor }, { timeout: 20000 })
-          : client.listResources({ cursor: args.cursor }, { timeout: 20000 });
-      }),
+      catalog(
+        args.server_id,
+        'resources/list',
+        async (signal) => {
+          const client = await gateway.client(args.server_id);
+          return args.templates
+            ? client.listResourceTemplates({ cursor: args.cursor }, { timeout: 20000, signal })
+            : client.listResources({ cursor: args.cursor }, { timeout: 20000, signal });
+        },
+        args.wait_ms,
+      ),
   );
 
-  server.registerTool(
+  register(
     'mcp_read_resource',
     {
       description:
         'Read a backend MCP resource by its original URI from mcp_list_resources. Resource text/blobs are returned without public file URLs. If running, poll mcp_read_call.',
-      inputSchema: { server_id: serverId, uri: z.string().min(1).max(8192) },
+      inputSchema: { server_id: serverId, uri: z.string().min(1).max(8192), wait_ms: wait },
       annotations: readonly,
     },
     (args) =>
-      catalog(args.server_id, 'resources/read', async () =>
-        (await gateway.client(args.server_id)).readResource({ uri: args.uri }, { timeout: 30000 }),
+      catalog(
+        args.server_id,
+        'resources/read',
+        async (signal) =>
+          (await gateway.client(args.server_id)).readResource(
+            { uri: args.uri },
+            { timeout: 30000, signal },
+          ),
+        args.wait_ms,
       ),
   );
 
-  server.registerTool(
+  register(
     'mcp_list_prompts',
     {
       description:
         'List reusable prompts exposed by a backend MCP server. If running, poll mcp_read_call.',
-      inputSchema: { server_id: serverId, cursor: z.string().optional() },
+      inputSchema: { server_id: serverId, cursor: z.string().optional(), wait_ms: wait },
       annotations: readonly,
     },
     (args) =>
-      catalog(args.server_id, 'prompts/list', async () =>
-        (await gateway.client(args.server_id)).listPrompts(
-          { cursor: args.cursor },
-          { timeout: 20000 },
-        ),
+      catalog(
+        args.server_id,
+        'prompts/list',
+        async (signal) =>
+          (await gateway.client(args.server_id)).listPrompts(
+            { cursor: args.cursor },
+            { timeout: 20000, signal },
+          ),
+        args.wait_ms,
       ),
   );
 
-  server.registerTool(
+  register(
     'mcp_get_prompt',
     {
       description:
@@ -208,26 +242,31 @@ export function registerGatewayTools(
         server_id: serverId,
         name: z.string().min(1).max(512),
         arguments: z.record(z.string(), z.string()).default({}),
+        wait_ms: wait,
       },
       annotations: readonly,
     },
     (args) =>
-      catalog(args.server_id, 'prompts/get', async () =>
-        (await gateway.client(args.server_id)).getPrompt(
-          { name: args.name, arguments: args.arguments },
-          { timeout: 20000 },
-        ),
+      catalog(
+        args.server_id,
+        'prompts/get',
+        async (signal) =>
+          (await gateway.client(args.server_id)).getPrompt(
+            { name: args.name, arguments: args.arguments },
+            { timeout: 20000, signal },
+          ),
+        args.wait_ms,
       ),
   );
 
   for (const tool of gateway.namespacedTools()) {
-    server.registerTool(
+    register(
       tool.name,
       {
         title: tool.original.title,
         description: `${tool.original.description ?? tool.original.name}\nProxied through PC MCP. If status=running, poll mcp_read_call using call_id.`,
         inputSchema: tool.schema,
-        annotations: tool.original.annotations ?? mutable,
+        annotations: { ...mutable, ...tool.original.annotations, openWorldHint: true },
       },
       (args) =>
         execute(
@@ -238,9 +277,11 @@ export function registerGatewayTools(
               tool.original.name,
               z.record(z.string(), z.unknown()).parse(args),
               1000,
+              signal,
             ),
           `${tool.serverId} · ${tool.original.name}`,
         ),
     );
   }
+  return names;
 }

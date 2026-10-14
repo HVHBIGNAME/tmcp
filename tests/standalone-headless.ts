@@ -33,6 +33,7 @@ Object.assign(env, {
   MCP_PORT: String(port),
   MCP_LOCAL_ONLY: 'true',
   MCP_GATEWAY_DISCOVER: 'false',
+  MCP_ROOTS: JSON.stringify([base]),
   MCP_ENABLE_SCREENSHOTS: 'false',
 });
 let installed:
@@ -67,7 +68,7 @@ async function stop() {
     timeout: 30000,
   });
 }
-async function call(key: string) {
+async function call(key: string, name = 'system_info', args: Record<string, unknown> = {}) {
   const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
     method: 'POST',
     headers: {
@@ -79,13 +80,14 @@ async function call(key: string) {
       jsonrpc: '2.0',
       id: 1,
       method: 'tools/call',
-      params: { name: 'system_info', arguments: {} },
+      params: { name, arguments: args },
     }),
     signal: AbortSignal.timeout(10000),
   });
   assert.equal(response.status, 200);
   const result = await response.json();
   assert(result.result && !result.result.isError && !result.error);
+  return result.result.structuredContent;
 }
 try {
   assert.deepEqual(await readdir(download), ['TMCP.exe']);
@@ -160,9 +162,22 @@ try {
   assert.equal(state.version, JSON.parse(await readFile('package.json', 'utf8')).version);
   const issued = await api('/tokens', 'POST', {
     name: 'CI standalone runtime',
-    permissions: ['files:read'],
+    permissions: ['files:read', 'shell'],
   });
   await call(issued.token);
+  await api('/settings', 'PATCH', { approval: { policy: 'always' } });
+  let job = await call(issued.token, 'run_command', {
+    command: 'node -e "console.log(process.execPath)"',
+    wait_ms: 1000,
+  });
+  for (let i = 0; job.status === 'running' && i < 20; i++)
+    job = await call(issued.token, 'read_command', { job_id: job.job_id, wait_ms: 1000 });
+  assert.equal(job.status, 'exited', job.stderr);
+  assert.equal(job.exit_code, 0, job.stderr);
+  assert(
+    job.stdout.includes(installed.node),
+    'Managed command must use the bundled Node without global PATH',
+  );
   const startup = await api('/autostart', 'PATCH', { enabled: true });
   registration = startup.registrationName;
   assert(registration && registration.startsWith('TMCP-'));

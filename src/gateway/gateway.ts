@@ -21,7 +21,8 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { childEnvironment, type Config } from '../config.js';
-import { errorMessage, hash, isErrno, SerialQueue } from '../utils.js';
+import { abortable, errorMessage, hash, isErrno, SerialQueue } from '../utils.js';
+import { jsonResult, toolError } from '../tool-result.js';
 import type { Logger } from '../tools.js';
 import { redactedStream } from '../redaction.js';
 import {
@@ -62,16 +63,19 @@ export class Gateway {
   private readonly reloads = new SerialQueue();
   private discovery: Discovery = { servers: [], sources: [], diagnostics: [] };
   private closing = false;
+  private warming?: Promise<void>;
 
   constructor(
     private readonly config: Config,
     private readonly log: Logger,
+    private readonly protectSources?: (paths: string[]) => Promise<void>,
   ) {}
 
   async reload(warmup = true): Promise<void> {
     await this.reloads.run(async () => {
       if (this.closing) throw new Error('Gateway is shutting down');
       const discovery = await discoverServers(this.config);
+      await this.protectSources?.(discovery.sources);
       const next = new Set(discovery.servers.map((spec) => spec.id));
       for (const [id, backend] of this.backends) {
         if (!next.has(id)) {
@@ -86,6 +90,7 @@ export class Gateway {
       }
       this.discovery = discovery;
       if (warmup && this.config.gatewayMode === 'namespaced') await this.warmup();
+      else if (this.config.gatewayMode === 'namespaced') void this.warmup();
     });
   }
 
@@ -105,6 +110,7 @@ export class Gateway {
               ? 'error'
               : 'not_connected',
         tools_cached: backend.tools?.length,
+        capabilities: backend.client?.getServerCapabilities(),
         error: backend.error,
       })),
     };
@@ -171,6 +177,7 @@ export class Gateway {
     }));
     client.setNotificationHandler(ToolListChangedNotificationSchema, () => {
       backend.tools = undefined;
+      if (this.config.gatewayMode === 'namespaced' && !this.closing) void this.warmup();
     });
     client.onclose = () => {
       if (backend.client === client) {
@@ -242,10 +249,11 @@ export class Gateway {
     query: string,
     offset: number,
     limit: number,
+    signal?: AbortSignal,
   ) {
     const backend = this.backend(id);
     const client = await this.client(id);
-    const page = await client.listTools(cursor ? { cursor } : {}, { timeout: 20000 });
+    const page = await client.listTools(cursor ? { cursor } : {}, { timeout: 20000, signal });
     if (!cursor && !page.nextCursor) backend.tools = page.tools;
     const matches = page.tools.filter((tool) =>
       `${tool.name} ${tool.description ?? ''}`.toLowerCase().includes(query.toLowerCase()),
@@ -257,6 +265,7 @@ export class Gateway {
       server_id: id,
       server_info: client.getServerVersion(),
       server_instructions: client.getInstructions(),
+      server_capabilities: client.getServerCapabilities(),
       tools,
       total_in_page: matches.length,
       next_offset: offset + limit < matches.length ? offset + limit : null,
@@ -265,11 +274,17 @@ export class Gateway {
   }
 
   private toolName(spec: ServerSpec, name: string): string {
-    return `${spec.id}__${name.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64)}_${hash(name).slice(0, 6)}`;
+    const suffix = '_' + hash(spec.id + '\0' + name).slice(0, 12);
+    return (
+      `${spec.id.slice(0, 20)}__${name.replace(/[^a-zA-Z0-9_-]/g, '_')}`.slice(
+        0,
+        64 - suffix.length,
+      ) + suffix
+    );
   }
 
-  async warmup(): Promise<void> {
-    await Promise.all(
+  warmup(): Promise<void> {
+    return (this.warming ??= Promise.all(
       [...this.backends.values()].map(async (backend) => {
         try {
           const client = await this.client(backend.spec.id);
@@ -289,7 +304,11 @@ export class Gateway {
           backend.error = redact(backend.spec, errorMessage(error));
         }
       }),
-    );
+    )
+      .then(() => undefined)
+      .finally(() => {
+        this.warming = undefined;
+      }));
   }
 
   namespacedTools() {
@@ -340,6 +359,7 @@ export class Gateway {
     name: string,
     args: Record<string, unknown>,
     waitMs: number,
+    requestSignal?: AbortSignal,
   ): Promise<CallToolResult> {
     return this.runCall(
       owner,
@@ -353,6 +373,7 @@ export class Gateway {
           })
           .then((result) => CallToolResultSchema.parse(result)),
       waitMs,
+      requestSignal,
     );
   }
 
@@ -360,21 +381,17 @@ export class Gateway {
     owner: string,
     id: string,
     name: string,
-    operation: () => Promise<Record<string, unknown>>,
+    operation: (signal: AbortSignal) => Promise<Record<string, unknown>>,
     waitMs = 1000,
+    requestSignal?: AbortSignal,
   ): Promise<CallToolResult> {
     return this.runCall(
       owner,
       id,
       name,
-      async () => {
-        const result = await operation();
-        return {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-          structuredContent: result,
-        };
-      },
+      async (_client, signal) => jsonResult(await operation(signal)),
       waitMs,
+      requestSignal,
     );
   }
 
@@ -384,7 +401,9 @@ export class Gateway {
     name: string,
     operation: (client: Client, signal: AbortSignal) => Promise<CallToolResult>,
     waitMs: number,
+    requestSignal?: AbortSignal,
   ): Promise<CallToolResult> {
+    requestSignal?.throwIfAborted();
     if (this.closing) throw new Error('Gateway is shutting down');
     this.pruneCalls();
     if ([...this.calls.values()].filter((call) => !call.finishedAt).length >= 16)
@@ -401,21 +420,28 @@ export class Gateway {
       done: Promise.resolve(),
     };
     this.calls.set(call.id, call);
+    const cancel = () => call.abort.abort();
+    requestSignal?.addEventListener('abort', cancel, { once: true });
+    if (requestSignal?.aborted) cancel();
     call.done = (async () => {
       try {
-        const client = await this.client(id);
+        const client = await abortable(this.client(id), call.abort.signal);
         call.abort.signal.throwIfAborted();
-        const result = await operation(client, call.abort.signal);
+        const result = await abortable(operation(client, call.abort.signal), call.abort.signal);
         const bytes = Buffer.byteLength(JSON.stringify(result));
         if (bytes > 16 * 1024 * 1024)
           throw new Error('Backend result exceeds 16 MiB; request a smaller result');
         call.result = result;
         call.bytes = bytes;
       } catch (error) {
-        call.result = {
-          isError: true,
-          content: [{ type: 'text', text: redact(backend.spec, errorMessage(error)) }],
-        };
+        call.result = toolError(
+          call.abort.signal.aborted
+            ? new DOMException(
+                'Backend call cancelled; already completed side effects are not reverted',
+                'AbortError',
+              )
+            : new Error(redact(backend.spec, errorMessage(error))),
+        );
       } finally {
         call.finishedAt = Date.now();
         this.log({
@@ -429,17 +455,33 @@ export class Gateway {
         this.pruneCalls();
       }
     })();
-    return this.readCall(owner, call.id, waitMs);
+    try {
+      return await this.readCall(owner, call.id, waitMs, requestSignal);
+    } finally {
+      requestSignal?.removeEventListener('abort', cancel);
+    }
   }
 
-  async readCall(owner: string, id: string, waitMs: number): Promise<CallToolResult> {
+  async readCall(
+    owner: string,
+    id: string,
+    waitMs: number,
+    signal?: AbortSignal,
+  ): Promise<CallToolResult> {
+    this.pruneCalls();
+    signal?.throwIfAborted();
     const call = this.calls.get(id);
     if (!call || call.owner !== owner)
       throw new Error('Unknown or expired MCP call_id for this client');
     if (!call.finishedAt && waitMs > 0) {
       const abort = new AbortController();
       try {
-        await Promise.race([call.done, delay(waitMs, undefined, { signal: abort.signal })]);
+        await Promise.race([
+          call.done,
+          delay(waitMs, undefined, {
+            signal: signal ? AbortSignal.any([signal, abort.signal]) : abort.signal,
+          }),
+        ]);
       } finally {
         abort.abort();
       }
@@ -451,7 +493,7 @@ export class Gateway {
           ...call.result._meta,
           'gateway/call_id': id,
           'gateway/server_id': call.serverId,
-          'gateway/status': 'completed',
+          'gateway/status': call.abort.signal.aborted ? 'cancelled' : 'completed',
         },
       };
     const status = {
@@ -469,12 +511,13 @@ export class Gateway {
   }
 
   cancelCall(owner: string, id: string) {
+    this.pruneCalls();
     const call = this.calls.get(id);
     if (!call || call.owner !== owner) throw new Error('Unknown MCP call_id for this client');
-    call.abort.abort();
+    if (!call.finishedAt) call.abort.abort();
     return {
       call_id: id,
-      cancellation_requested: true,
+      cancellation_requested: !call.finishedAt,
       note: 'Cancellation is cooperative; a backend may already have completed side effects.',
     };
   }

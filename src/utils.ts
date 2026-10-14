@@ -22,11 +22,27 @@ export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+export async function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  let abort!: () => void;
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    abort = () => reject(signal.reason ?? new DOMException('Request cancelled', 'AbortError'));
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+  });
+  try {
+    return await Promise.race([operation, cancelled]);
+  } finally {
+    signal.removeEventListener('abort', abort);
+  }
+}
+
 export async function atomicWrite(
   filename: string,
   content: string | Buffer,
   mode = 0o600,
+  signal?: AbortSignal,
 ): Promise<void> {
+  signal?.throwIfAborted();
   const temporary = path.join(path.dirname(filename), `.${path.basename(filename)}.${token()}.tmp`);
   const handle = await open(temporary, 'wx', mode);
   try {
@@ -36,6 +52,7 @@ export async function atomicWrite(
     } finally {
       await handle.close();
     }
+    signal?.throwIfAborted();
     await rename(temporary, filename);
   } catch (error) {
     await rm(temporary, { force: true });

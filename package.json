@@ -1,6 +1,6 @@
 {
   "name": "pc-mcp-tunnel",
-  "version": "2.1.1",
+  "version": "2.2.0",
   "private": true,
   "description": "Authenticated PC development tools over MCP and Cloudflare Tunnel",
   "type": "module",

@@ -132,6 +132,7 @@ async function application() {
     'dist/src',
     'ui/public',
     'scripts/secure-control-pipe.ps1',
+    'scripts/windows-job.ps1',
     'README.md',
     'docs/access-model.md',
   ]) {
@@ -198,11 +199,11 @@ if (files.length !== 1 || files[0] !== 'PcMcp.exe')
 await mkdir(path.join(root, 'release'), { recursive: true });
 const target = path.join(root, 'release', 'TMCP.exe');
 await cp(path.join(output, 'PcMcp.exe'), target);
-console.log(
+process.stdout.write(
   JSON.stringify({
     executable: target,
     bytes: (await stat(target)).size,
     sha256: await digest(target),
     version: pkg.version,
-  }),
+  }) + '\n',
 );

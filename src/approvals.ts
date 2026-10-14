@@ -25,6 +25,7 @@ interface Pending {
   /** Rejects once the request expires or the client goes away. */
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
+  cleanup: () => void;
 }
 
 export type ApprovalListener = (request: ApprovalRequest) => void | Promise<void>;
@@ -77,7 +78,9 @@ export class Approvals {
     rules: ApprovalRules;
     channel?: 'gui' | 'telegram';
     onWait?: () => void;
+    signal?: AbortSignal;
   }): Promise<ApprovalOutcome> {
+    input.signal?.throwIfAborted();
     const key = fingerprint(input.command, input.cwd);
     const verdict = decide(input.rules, input.command);
     if (verdict.action !== 'ask') return { action: verdict.action, remembered: false };
@@ -93,6 +96,7 @@ export class Approvals {
       clientId: input.clientId,
       channel: input.channel ?? 'gui',
       timeoutMs: this.lifetimeMs ?? input.rules.timeoutMs,
+      signal: input.signal,
     });
   }
 
@@ -102,6 +106,7 @@ export class Approvals {
     clientId: string;
     channel: 'gui' | 'telegram';
     timeoutMs: number;
+    signal?: AbortSignal;
   }): Promise<ApprovalOutcome> {
     const id = randomUUID();
     const now = Date.now();
@@ -117,14 +122,38 @@ export class Approvals {
       expiresAt: new Date(now + input.timeoutMs).toISOString(),
     };
     return new Promise<ApprovalOutcome>((resolve, reject) => {
+      const cancelled = () => {
+        const entry = this.pending.get(id);
+        if (!entry) return;
+        entry.cleanup();
+        this.pending.delete(id);
+        reject(input.signal?.reason ?? new DOMException('Request cancelled', 'AbortError'));
+      };
       const timer = setTimeout(() => {
+        this.pending.get(id)?.cleanup();
         this.pending.delete(id);
         reject(new Error('Approval timed out. The command was not executed.'));
       }, input.timeoutMs);
       timer.unref();
-      this.pending.set(id, { request, resolve, reject, timer });
+      this.pending.set(id, {
+        request,
+        resolve,
+        reject,
+        timer,
+        cleanup: () => {
+          clearTimeout(timer);
+          input.signal?.removeEventListener('abort', cancelled);
+        },
+      });
+      input.signal?.addEventListener('abort', cancelled, { once: true });
+      if (input.signal?.aborted) {
+        cancelled();
+        return;
+      }
       for (const listener of this.listeners) {
-        void Promise.resolve(listener(request)).catch(() => undefined);
+        void Promise.resolve()
+          .then(() => listener(request))
+          .catch(() => undefined);
       }
     });
   }
@@ -143,7 +172,7 @@ export class Approvals {
     const entry = this.pending.get(id);
     if (!entry) throw new Error('This approval request has expired or was already answered');
     if (remember) this.remembered.set(entry.request.fingerprint, action);
-    clearTimeout(entry.timer);
+    entry.cleanup();
     this.pending.delete(id);
     const outcome: ApprovalOutcome =
       action === 'allow' ? { action: 'allow', remembered: remember } : { action: 'deny' };
@@ -154,7 +183,7 @@ export class Approvals {
   /** Fails every pending request, used when the server is shutting down. */
   cancelAll(reason: string): void {
     for (const [id, entry] of this.pending) {
-      clearTimeout(entry.timer);
+      entry.cleanup();
       this.pending.delete(id);
       entry.reject(new Error(reason));
     }

@@ -1541,13 +1541,11 @@ summary:hover {
   animation: dialog-in 0.28s var(--ease-out-expo);
 }
 .dialog::backdrop {
-  background: #05060a;
-  opacity: 0.74;
-  backdrop-filter: blur(6px);
+  background: rgba(5, 6, 10, 0.48);
+  backdrop-filter: blur(4px);
 }
 :root[data-theme='light'] .dialog::backdrop {
-  background: #14100a;
-  opacity: 0.35;
+  background: rgba(20, 16, 10, 0.25);
 }
 .dialog[open]::backdrop {
   animation: backdrop-in 0.22s ease-out both;

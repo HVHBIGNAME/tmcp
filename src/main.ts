@@ -110,7 +110,11 @@ try {
     log,
     deferGatewayWarmup: true,
     startedAt: runtime.startedAt,
-    status: () => ({ ...runtime, gateway: service?.gateway.listServers() }),
+    status: () => ({
+      ...runtime,
+      gateway: service?.gateway.listServers(),
+      tunnelDiagnostics: tunnels?.diagnostics(),
+    }),
     shutdown: () => {
       void stop(0);
     },
@@ -167,12 +171,12 @@ try {
     await persistRuntime();
   }
   log({ event: 'listener_ready', localUrl: config.localUrl });
-  console.log(
-    'Client access: issue a key in Access or with tmcp token create. Local control uses OS-protected IPC.',
+  process.stdout.write(
+    'Client access: issue a key in Access or with tmcp token create. Local control uses OS-protected IPC.\n',
   );
   if (mode !== 'local' && mode === 'quick')
-    console.log(
-      'Quick Tunnel: the URL changes when the tunnel is recreated. Reconnect Notion after reading this line.',
+    process.stdout.write(
+      'Quick Tunnel: the URL changes when the tunnel is recreated. Reconnect Notion after reading this line.\n',
     );
 } catch (error) {
   log({ event: 'startup_error', message: errorMessage(error) });

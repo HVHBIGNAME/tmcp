@@ -231,6 +231,8 @@ internal sealed class MainForm : Form
             _waiting.Visible = true; _waiting.BringToFront();
             _tray.SetBusy(true, "устанавливаем обновление…");
             (installer, abort) = await WindowsUpdates.StartInstallerAsync(plan, Visible, _closing.Token);
+            await ApiAsync("/maintenance", new { enabled = true }, "PATCH");
+            if (!await UpdateIdleAsync()) throw new IOException("Во время подготовки появились активные операции. Обновление отложено; команды продолжают работать.");
             await Program.RunCliAsync("stop");
             _quitting = true; Close();
             return true;

@@ -97,6 +97,13 @@ class OutputWindow {
   read(cursor: number) {
     const start = this.end - this.text.length;
     const from = Math.max(start, Math.min(cursor, this.end));
+    if (
+      /^[\uDC00-\uDFFF]$/.test(this.text[from - start] ?? '') &&
+      /^[\uD800-\uDBFF]$/.test(this.text[from - start - 1] ?? '')
+    )
+      throw new Error(
+        'Invalid output cursor: it splits a Unicode character. Use the returned stdout_cursor and stderr_cursor.',
+      );
     let end = Math.min(this.text.length, from - start + 40000);
     if (
       /[\uD800-\uDBFF]/.test(this.text[end - 1] ?? '') &&

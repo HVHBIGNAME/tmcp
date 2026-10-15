@@ -1,6 +1,26 @@
 param([Parameter(Mandatory = $true)][string]$Manifest)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$Diagnostic = Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Manifest))) 'installer-state.json'
+$Phase = 'starting'
+function Set-InstallerPhase([string]$Name, [string]$Message = '') {
+    $script:Phase = $Name
+    if ($Message.Length -gt 2048) { $Message = $Message.Substring(0, 2048) }
+    $Value = @{ phase = $Name; message = $Message; at = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json -Compress
+    $Temporary = $Diagnostic + '.tmp'
+    try {
+        [IO.File]::WriteAllText($Temporary, $Value, [Text.UTF8Encoding]::new($false))
+        if ([IO.File]::Exists($Diagnostic)) { [IO.File]::Replace($Temporary, $Diagnostic, [NullString]::Value) }
+        else { [IO.File]::Move($Temporary, $Diagnostic) }
+    } catch { Write-Warning ('Installer diagnostics: ' + $_.Exception.Message) }
+}
+trap {
+    $Failure = $_.Exception.Message
+    try { Set-InstallerPhase $Phase $Failure } catch { [Console]::Error.WriteLine('Unable to save installer diagnostics.') }
+    [Console]::Error.WriteLine($Failure)
+    exit 1
+}
+Set-InstallerPhase 'starting'
 Import-Module "$PSHOME\Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1" -ErrorAction Stop
 $Utf8 = New-Object Text.UTF8Encoding $false
 $Plan = Get-Content -LiteralPath $Manifest -Raw | ConvertFrom-Json
@@ -79,8 +99,10 @@ $Mutex = New-Object Threading.Mutex($false, ('Local\TMCP.Update.' + $Identity))
 $Owned = $Mutex.WaitOne(0)
 if (-not $Owned) { $Mutex.Dispose(); throw 'Another update installer is running.' }
 try {
+    Set-InstallerPhase 'verifying-download'
     if ((Get-FileHash -LiteralPath $Plan.candidate -Algorithm SHA256).Hash -ne $Plan.sha256) { throw 'Update SHA-256 mismatch.' }
     if (-not [IO.File]::Exists($Target)) { throw 'Installed executable is missing.' }
+    Set-InstallerPhase 'waiting-for-application-exit'
     [IO.File]::WriteAllText((Join-Path $Stage 'installer.ready'), 'ready', $Utf8)
     $Old = Get-Process -Id $Plan.oldPid -ErrorAction SilentlyContinue
     if ($Old -and $Old.Path -eq $Plan.oldExecutable) {
@@ -94,9 +116,12 @@ try {
     }
     if ([IO.File]::Exists($Abort)) { return }
     Save-Status 'installing' 'Installing the verified update.'
+    Set-InstallerPhase 'replacing-executable'
     [IO.File]::Replace($Plan.candidate, $Target, $Backup)
     $Changed = $true
+    Set-InstallerPhase 'starting-application'
     $NewProcess = Start-App $true
+    Set-InstallerPhase 'waiting-for-application-ready'
     $Deadline = [DateTime]::UtcNow.AddMinutes(5)
     $Healthy = $false
     while ([DateTime]::UtcNow -lt $Deadline) {
@@ -111,9 +136,11 @@ try {
     }
     if (-not $Healthy) { throw 'The updated application did not report readiness.' }
     Save-Status 'installed' 'Update installed and startup verified.'
+    Set-InstallerPhase 'installed'
     try { Remove-OldUpdates } catch { Write-Warning ('Old update cleanup: ' + $_.Exception.Message) }
 } catch {
     $Failure = $_.Exception.Message
+    try { Set-InstallerPhase $Phase $Failure } catch { Write-Warning 'Unable to save installer diagnostics.' }
     if ($Changed) {
         try {
             if ($NewProcess -and -not $NewProcess.HasExited) { $NewProcess.Kill(); $NewProcess.WaitForExit(10000) | Out-Null }

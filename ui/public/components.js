@@ -210,11 +210,19 @@ export function modal({
   const form = el('form', { noValidate: true });
   const error = el('div', { className: 'inline-error', role: 'alert', tabIndex: -1, hidden: true });
   let pending = false;
+  let closing;
   const close = () => {
     if (pending) return;
-    dialog.close();
-    dialog.remove();
-    if (previous?.isConnected) previous.focus();
+    return (closing ??= (async () => {
+      dialog.dataset.closing = 'true';
+      const animations = dialog
+        .getAnimations()
+        .filter((animation) => animation.animationName === 'dialog-out');
+      await Promise.all(animations.map((animation) => animation.finished.catch(() => undefined)));
+      dialog.close();
+      dialog.remove();
+      if (previous?.isConnected) previous.focus();
+    })());
   };
   const cancel = button(
     submitLabel ? 'Отмена' : 'Готово',
@@ -242,7 +250,7 @@ export function modal({
   dialog.append(form);
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
-    if (pending || !onSubmit) return;
+    if (pending || closing || !onSubmit) return;
     pending = true;
     submit.disabled = true;
     cancel.disabled = true;
@@ -252,7 +260,7 @@ export function modal({
     try {
       const afterClose = await onSubmit();
       pending = false;
-      close();
+      await close();
       if (typeof afterClose === 'function') afterClose();
     } catch (failure) {
       error.textContent = failure.message || 'Не удалось выполнить действие.';

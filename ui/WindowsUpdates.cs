@@ -52,6 +52,7 @@ internal sealed class WindowsUpdates : IDisposable
         if (!State.Supported || _disposed) return;
         if (!enabled && !_manual)
         {
+            if (_busy && _plan != null) return;
             _request?.Cancel();
             if (_plan != null) { DeletePlan(); Set("disabled", "Автообновления выключены."); }
             else if (!_busy && State.Status != "disabled") Set("disabled", "Автообновления выключены. Можно проверить и установить новую версию вручную.");
@@ -60,13 +61,15 @@ internal sealed class WindowsUpdates : IDisposable
         if (_busy) return;
         if (_plan != null)
         {
+            var plan = _plan;
             _busy = true;
             try
             {
-                if (await _install(_plan)) Set("installing", "Устанавливаем обновление и перезапускаем приложение…");
+                if (await _install(plan)) Set("installing", "Устанавливаем обновление и перезапускаем приложение…");
                 else Set("waiting", "Обновление загружено. Ждём завершения команд, запросов и редактирования форм.", 100);
             }
-            catch (Exception error) { Failed(error); DeletePlan(); }
+            catch (OperationCanceledException) when (_disposed) { DeletePlan(); }
+            catch (Exception error) { InstallerStartup.PreserveFailure(_home, plan, error); Failed(error); DeletePlan(); }
             finally { _busy = false; }
         }
         else if (DateTime.UtcNow >= _nextCheck) _ = CheckAsync(false);
@@ -162,15 +165,19 @@ internal sealed class WindowsUpdates : IDisposable
         var process = Process.Start(info) ?? throw new IOException("Cannot start the update installer.");
         try
         {
-            var deadline = DateTime.UtcNow.AddSeconds(15);
-            while (!File.Exists(Path.Combine(plan.Directory, "installer.ready")))
-            {
-                if (process.HasExited || DateTime.UtcNow > deadline) throw new IOException("The update installer did not become ready.");
-                await Task.Delay(100, cancellation);
-            }
+            await InstallerStartup.WaitAsync(process, plan.Directory, cancellation);
             return (process, abort);
         }
-        catch { await File.WriteAllTextAsync(abort, "abort", CancellationToken.None); if (!process.HasExited) process.Kill(); process.Dispose(); throw; }
+        catch
+        {
+            try { await File.WriteAllTextAsync(abort, "abort", CancellationToken.None); }
+            finally
+            {
+                try { if (!process.HasExited) process.Kill(); await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5)); }
+                finally { process.Dispose(); }
+            }
+            throw;
+        }
     }
 
     public void Dispose() { _disposed = true; _closed.Cancel(); _request?.Cancel(); _http.Dispose(); }

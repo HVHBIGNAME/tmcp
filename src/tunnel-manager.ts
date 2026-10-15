@@ -12,7 +12,8 @@ export interface TunnelState {
   lastError: string | null;
 }
 
-type ManagedTunnel = Pick<CloudflareTunnel, 'url' | 'stop'>;
+type ManagedTunnel = Pick<CloudflareTunnel, 'url' | 'stop'> &
+  Partial<Pick<CloudflareTunnel, 'diagnostics'>>;
 type TunnelLauncher = (...args: Parameters<typeof startTunnel>) => Promise<ManagedTunnel>;
 
 /** Reconnects the tunnel independently of the MCP listener and running commands. */
@@ -45,6 +46,10 @@ export class TunnelManager {
     if (!tunnelToken || !publicUrl.startsWith('https://'))
       throw new Error('Named tunnel requires a hostname and connector token');
     return { ...this.config, publicUrl, tunnelToken };
+  }
+
+  diagnostics() {
+    return this.current?.diagnostics?.() ?? null;
   }
 
   async restart(mode: 'quick' | 'named'): Promise<string> {

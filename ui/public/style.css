@@ -1550,6 +1550,12 @@ summary:hover {
 .dialog[open]::backdrop {
   animation: backdrop-in 0.22s ease-out both;
 }
+.dialog[data-closing] {
+  animation: dialog-out 0.16s ease-in both;
+}
+.dialog[data-closing]::backdrop {
+  animation: backdrop-in 0.16s ease-in reverse both;
+}
 .dialog form {
   display: flex;
   flex-direction: column;
@@ -1824,6 +1830,16 @@ summary:hover {
   }
   to {
     opacity: 1;
+  }
+}
+@keyframes dialog-out {
+  from {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: translateY(6px) scale(0.985);
   }
 }
 @keyframes toast-in {
@@ -2143,7 +2159,8 @@ summary:hover {
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
-  *::after {
+  *::after,
+  *::backdrop {
     animation: none !important;
     transition: none !important;
     scroll-behavior: auto !important;

@@ -30,6 +30,21 @@ server.registerTool('fail', { inputSchema: {} }, () => ({
   content: [{ type: 'text', text: 'intentional backend failure' }],
 }));
 server.registerTool(
+  'large_result',
+  {
+    inputSchema: {
+      bytes: z
+        .number()
+        .int()
+        .min(0)
+        .max(17 * 1024 * 1024),
+    },
+  },
+  ({ bytes }) => ({
+    content: [{ type: 'text', text: 'x'.repeat(bytes) }],
+  }),
+);
+server.registerTool(
   'drop_after_increment',
   { inputSchema: { counter: z.string() } },
   async ({ counter }) => {

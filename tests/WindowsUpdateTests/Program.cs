@@ -97,6 +97,30 @@ await Case("failed version waits for an explicit retry", async home =>
     await updates.CheckAsync(true);
     Check(updates.State.Status == "waiting" && handler.Downloads == 1, "Explicit retry did not download the update");
 });
+await Case("active installer retains its candidate and failure diagnostics survive cleanup", async home =>
+{
+    var entered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    using var updates = new WindowsUpdates(home, "2.1.0", true, _ => { }, async plan =>
+    {
+        File.WriteAllText(Path.Combine(plan.Directory, "installer-state.json"), "{\"phase\":\"verifying-download\",\"message\":\"fixture failure\"}");
+        entered.SetResult(true);
+        await release.Task;
+        Check(File.Exists(plan.Candidate), "Disabling updates deleted a candidate still used by the installer");
+        throw new IOException("fixture startup error");
+    }, new HttpClient(new ReleaseHandler()));
+    await updates.CheckAsync(false);
+    var installing = updates.TickAsync(true);
+    await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+    try { await updates.TickAsync(false); }
+    finally { release.TrySetResult(true); }
+    await installing;
+    Check(updates.State.Status == "failed", "Installer failure was not reported");
+    var saved = File.ReadAllText(Path.Combine(home, ".updates", "last-installer-error.json"));
+    Check(saved.Contains("verifying-download") && saved.Contains("fixture startup error"), "Failure diagnostics were deleted with the candidate");
+    Check(Directory.GetFiles(home, "TMCP.exe", SearchOption.AllDirectories).Length == 0, "Failed candidate was not cleaned up");
+});
+await InstallerStartupTests.Run(Case);
 Environment.ExitCode = failures == 0 ? 0 : 1;
 
 sealed class ReleaseHandler : HttpMessageHandler

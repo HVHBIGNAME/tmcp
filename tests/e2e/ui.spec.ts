@@ -105,6 +105,8 @@ test('token creation, permissions, rotation and deletion work with custom dialog
   await page.getByRole('button', { name: 'Создать токен', exact: true }).click();
   const issued = page.getByRole('textbox', { name: 'Новый токен', exact: true });
   await expect(issued).toBeVisible();
+  await expect(page.locator('dialog')).toHaveCount(1);
+  expect(server.service.tokens.list()).toHaveLength(1);
   const oldKey = await issued.inputValue();
   expect(server.service.tokens.find(oldKey)).toBeTruthy();
   expect(server.service.tokens.find(oldKey)?.permissions).toEqual(['files:read']);
@@ -127,6 +129,68 @@ test('token creation, permissions, rotation and deletion work with custom dialog
   await page.getByRole('button', { name: 'Удалить', exact: true }).click();
   await page.getByRole('button', { name: 'Удалить токен', exact: true }).click();
   await expect.poll(() => server.service.tokens.list()).toHaveLength(0);
+});
+
+test('dialog remains modal while closing, restores focus and respects reduced motion', async ({
+  page,
+  server,
+}) => {
+  server.connect();
+  await page.goto(server.url);
+  await page.locator('nav').getByRole('button', { name: 'Доступ', exact: true }).click();
+  const launcher = page.getByRole('button', { name: 'Новый токен', exact: true });
+  await launcher.click();
+  const dialog = page.getByRole('dialog');
+  const during = await dialog.evaluate((element) => {
+    const cancel = [...element.querySelectorAll('button')].find(
+      (button) => button.textContent === 'Отмена',
+    )!;
+    cancel.click();
+    cancel.click();
+    return {
+      modal: element.matches(':modal'),
+      focusInside: element.contains(document.activeElement),
+    };
+  });
+  expect(during).toEqual({ modal: true, focusInside: true });
+  await expect(dialog).toHaveCount(0);
+  await expect(launcher).toBeFocused();
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await launcher.click();
+  expect(
+    await dialog.evaluate(
+      (element) =>
+        element.getAnimations().filter((animation) => animation.playState === 'running').length,
+    ),
+  ).toBe(0);
+  await page.keyboard.press('Escape');
+  await expect(dialog).toHaveCount(0);
+  await expect(launcher).toBeFocused();
+});
+
+test('tunnel diagnostics show transport failures without claiming the address was checked', async ({
+  page,
+  server,
+}) => {
+  server.connect();
+  Object.assign(server.runtime, {
+    tunnelDiagnostics: {
+      activeConnections: 3,
+      protocol: 'http2',
+      requestFailures: 2,
+      lastFailure: { kind: 'control_stream', at: new Date().toISOString() },
+    },
+  });
+  await page.goto(server.url);
+  await expect(
+    page.getByRole('heading', { name: 'Туннель зарегистрирован', exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText(/Соединений с Cloudflare: 3/)).toContainText(
+    'обрыв управляющего потока',
+  );
+  await expect(
+    page.getByRole('button', { name: 'Проверить доступность', exact: true }),
+  ).toBeEnabled();
 });
 
 test('IPC connection recovers without reloading or showing raw HTML errors', async ({

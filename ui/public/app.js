@@ -334,6 +334,7 @@ export function createControlApp() {
     );
     copyButton.disabled = true;
     const checkResult = el('div', { className: 'check-result', role: 'status', hidden: true });
+    const tunnelDetails = el('p', { className: 'field-hint', hidden: true });
     let lastCheck = null;
     const checkButton = button('Проверить доступность', 'bolt', async () => {
       const url = state.data.connection.mcpUrl;
@@ -367,6 +368,7 @@ export function createControlApp() {
           checkButton,
         ]),
         checkResult,
+        tunnelDetails,
       ]),
       metrics,
       pending,
@@ -439,6 +441,21 @@ export function createControlApp() {
           ? 'Туннель восстанавливается. Детали и параметры доступны в настройках.'
           : 'Адрес появится здесь автоматически. Локальный сервер уже работает.';
       checkResult.hidden = !lastCheck;
+      const diagnostics = c?.diagnostics;
+      tunnelDetails.hidden = !diagnostics;
+      if (diagnostics) {
+        const failures = {
+          origin_unreachable: 'локальный сервис недоступен туннелю',
+          control_stream: 'обрыв управляющего потока',
+          request_failed: 'не удалось передать запрос',
+        };
+        const last = diagnostics.lastFailure;
+        tunnelDetails.textContent =
+          `Соединений с Cloudflare: ${diagnostics.activeConnections}${diagnostics.protocol ? ` · ${diagnostics.protocol.toUpperCase()}` : ''}. Ошибок передачи запросов: ${diagnostics.requestFailures}.` +
+          (last
+            ? ` Последняя (${new Date(last.at).toLocaleTimeString('ru-RU')}): ${failures[last.kind]}.`
+            : '');
+      }
       if (lastCheck) {
         checkResult.className = `check-result ${lastCheck.ok ? 'success-tone' : 'warning-tone'}`;
         checkResult.textContent =

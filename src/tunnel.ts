@@ -6,11 +6,13 @@ import { terminateTree } from './processes.js';
 import { atomicWrite, errorMessage } from './utils.js';
 import type { Logger } from './tools.js';
 import { redactedStream } from './redaction.js';
+import type { TunnelDiagnostics } from './tunnel-diagnostics.js';
 
 export interface CloudflareTunnel {
   url: string;
   process: ChildProcessWithoutNullStreams;
   stop(): Promise<void>;
+  diagnostics(): TunnelDiagnostics;
 }
 
 const registrationFailed =
@@ -22,6 +24,7 @@ const registered = /Registered tunnel connection/i;
 export interface RegistrationWatch {
   readonly failures: number;
   readonly reported: boolean;
+  readonly diagnostics: TunnelDiagnostics;
   feed(text: string): void;
 }
 
@@ -35,17 +38,41 @@ export function createRegistrationWatch(
   let reported = false;
   let lostSince: number | undefined;
   const healthy = new Set<string>();
+  let protocol: TunnelDiagnostics['protocol'] = null;
+  let requestFailures = 0;
+  let lastFailure: TunnelDiagnostics['lastFailure'] = null;
   return {
     get failures() {
       return failures;
+    },
+    get diagnostics() {
+      return {
+        activeConnections: healthy.size,
+        protocol,
+        requestFailures,
+        lastFailure: lastFailure ? { ...lastFailure } : null,
+      };
     },
     get reported() {
       return reported || (lostSince !== undefined && now() - lostSince >= recoveryMs);
     },
     feed(text: string) {
       for (const line of text.split(/\r?\n/)) {
+        const kind = /Unable to reach the origin service/i.test(line)
+          ? 'origin_unreachable'
+          : /failed to serve incoming request/i.test(line)
+            ? /control stream/i.test(line)
+              ? 'control_stream'
+              : 'request_failed'
+            : null;
+        if (kind) {
+          requestFailures = Math.min(Number.MAX_SAFE_INTEGER, requestFailures + 1);
+          lastFailure = { kind, at: new Date().toISOString() };
+        }
         const connection = /\bconnIndex=(\d+)\b/.exec(line)?.[1] ?? '0';
         if (registered.test(line)) {
+          const observed = /\bprotocol=(quic|http2)\b/.exec(line)?.[1];
+          if (observed === 'quic' || observed === 'http2') protocol = observed;
           healthy.add(connection);
           failures = 0;
           reported = false;
@@ -71,7 +98,7 @@ function watchRegistration(
   interval: number,
   onLost: (message: string) => void,
   isReady: () => boolean,
-): () => void {
+): { stop(): void; diagnostics(): TunnelDiagnostics } {
   const watch = createRegistrationWatch(confirmations);
   let announced = false;
   const timer = setInterval(() => {
@@ -92,10 +119,13 @@ function watchRegistration(
     stream.on('data', onData);
     return { stream, onData };
   });
-  return () => {
-    clearInterval(timer);
-    for (const { stream, onData } of listeners) stream.off('data', onData);
-    signal?.removeEventListener('abort', onAbort);
+  return {
+    diagnostics: () => watch.diagnostics,
+    stop: () => {
+      clearInterval(timer);
+      for (const { stream, onData } of listeners) stream.off('data', onData);
+      signal?.removeEventListener('abort', onAbort);
+    },
   };
 }
 
@@ -148,7 +178,7 @@ export async function startTunnel(
   let registered = false;
   let publicUrl = mode === 'named' ? config.publicUrl : '';
   let tail = '';
-  let unwatch: (() => void) | undefined;
+  let registration: ReturnType<typeof watchRegistration> | undefined;
   for (const stream of [child.stdout, child.stderr]) {
     const output = redactedStream([config.tunnelToken], (message) => {
       if (message.trim()) log({ event: 'cloudflared', message: message.trim() });
@@ -159,11 +189,11 @@ export async function startTunnel(
 
   const stop = async () => {
     stopping = true;
-    unwatch?.();
+    registration?.stop();
     await terminateTree(child);
   };
   try {
-    unwatch = watchRegistration(
+    registration = watchRegistration(
       child,
       signal,
       watch.confirmations ?? 3,
@@ -211,7 +241,7 @@ export async function startTunnel(
         else reject(new Error(message));
       });
     });
-    return { url: publicUrl, process: child, stop };
+    return { url: publicUrl, process: child, stop, diagnostics: registration.diagnostics };
   } catch (error) {
     await stop();
     throw error;

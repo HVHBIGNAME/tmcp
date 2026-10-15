@@ -169,6 +169,8 @@ export function createMcpServer(services: ToolServices, caller: Caller): McpServ
         throw new Error('Screenshots are disabled by the owner in PC MCP settings.');
       if (gate) await gate();
       signal?.throwIfAborted();
+      if (name === 'run_command' && !settings.get().shell.enabled)
+        throw new Error('Command execution was disabled by the owner while approval was pending.');
       services.traffic?.running(name);
       const result = await operation();
       services.traffic?.result(Boolean(result.isError));

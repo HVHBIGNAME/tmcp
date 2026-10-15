@@ -56,6 +56,24 @@ test('a silent total outage is reported after a recovery window and cleared by r
   assert.equal(watch.reported, false);
 });
 
+test('request diagnostics identify failures without leaking log contents or restarting a healthy tunnel', () => {
+  const watch = createRegistrationWatch(3);
+  watch.feed('INF Registered tunnel connection connIndex=0 protocol=http2');
+  watch.feed(
+    'ERR failed to serve incoming request error="Error shutting down control stream: client disconnected" url="https://private.example/?token=secret-value"',
+  );
+  assert.equal(watch.reported, false);
+  assert.equal(watch.diagnostics.activeConnections, 1);
+  assert.equal(watch.diagnostics.protocol, 'http2');
+  assert.equal(watch.diagnostics.requestFailures, 1);
+  assert.equal(watch.diagnostics.lastFailure?.kind, 'control_stream');
+  assert(!JSON.stringify(watch.diagnostics).includes('secret-value'));
+  watch.feed('ERR Unable to reach the origin service');
+  assert.equal(watch.diagnostics.lastFailure?.kind, 'origin_unreachable');
+  watch.feed('WRN Connection terminated connIndex=0');
+  assert.equal(watch.diagnostics.activeConnections, 0);
+});
+
 test('a tunnel whose registration is lost is reported only after consecutive failures', async (t) => {
   await fixture(t);
   // Windows cannot spawn a .cmd without a shell, so the process-level path is exercised by

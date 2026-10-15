@@ -56,6 +56,14 @@ async function inspect(page: Page, name: string) {
 try {
   browser = await chromium.launch();
   fixture.connect('https://workstation.tmcp.example');
+  Object.assign(fixture.runtime, {
+    tunnelDiagnostics: {
+      activeConnections: 3,
+      protocol: 'http2',
+      requestFailures: 1,
+      lastFailure: { kind: 'control_stream', at: '2026-10-14T12:00:00.000Z' },
+    },
+  });
   await fixture.service.tokens.create({
     name: 'Исследовательский проект',
     permissions: ['files:read', 'files:write', 'shell'],
@@ -141,7 +149,7 @@ try {
     path.join(output, 'report.json'),
     JSON.stringify({ checks, findings, manualReview }, null, 2),
   );
-  console.log(JSON.stringify({ checks, findings }, null, 2));
+  process.stdout.write(JSON.stringify({ checks, findings }, null, 2) + '\n');
   if (findings.length) process.exitCode = 1;
 } finally {
   await browser?.close();

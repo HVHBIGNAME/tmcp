@@ -22,6 +22,19 @@ test('control state distinguishes local readiness from a usable external MCP URL
   assert.equal((await state()).connection.mcpUrl, null);
   ui.connect('https://replacement.example.com');
   assert.equal((await state()).connection.mcpUrl, 'https://replacement.example.com/mcp');
+  Object.assign(ui.runtime, {
+    tunnelDiagnostics: {
+      activeConnections: 4,
+      protocol: 'http2',
+      requestFailures: 2,
+      lastFailure: { kind: 'control_stream', at: new Date().toISOString() },
+      secret: 'must-not-leak',
+    },
+  });
+  const diagnostics = (await state()).connection.diagnostics;
+  assert.equal(diagnostics.activeConnections, 4);
+  assert.equal(diagnostics.lastFailure.kind, 'control_stream');
+  assert(!JSON.stringify(diagnostics).includes('must-not-leak'));
 });
 
 test('invalid control requests return JSON without HTML, stack traces or input secrets', async (t) => {

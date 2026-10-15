@@ -131,3 +131,18 @@ test('gateway credential configuration is protected and live disabled capabiliti
   await call(client, 'write_file', { path: 'backend.json', content: '{}', overwrite: true }, true);
   await call(client, 'delete_path', { path: 'backend.json' }, true);
 });
+
+test('disabling commands while approval is pending prevents a later launch', async (t) => {
+  const instance = await httpFixture(t);
+  await instance.service.settings.update({ approval: { policy: 'once' } });
+  const client = await toolClient(t, instance.url, instance.headers);
+  const pending = call(client, 'run_command', { command: 'echo must-not-start' }, true);
+  for (let n = 0; instance.service.approvals.list().length === 0 && n < 100; n++) await delay(20);
+  const approval = instance.service.approvals.list()[0];
+  assert(approval);
+  await instance.service.settings.update({ shell: { enabled: false } });
+  instance.service.approvals.respond(approval.id, 'allow', false);
+  const result = await pending;
+  assert.equal(result.isError, true);
+  assert.equal(instance.service.processes.listAll().length, 0);
+});
